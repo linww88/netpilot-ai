@@ -1,15 +1,37 @@
 """设备连接管理模块""" 
 import logging 
 import os
+import re
+import socket
 import traceback
 from datetime import datetime
-from typing import Dict, List, Optional, Any 
+from typing import Dict, List, Optional, Any, Tuple 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from netmiko import ConnectHandler 
 from netmiko.exceptions import NetmikoTimeoutException, NetmikoAuthenticationException 
 from .session_pool import SessionPool 
 
 logger = logging.getLogger(__name__) 
+
+# eNSP 默认端口扫描范围
+DEFAULT_SCAN_START = 2000
+DEFAULT_SCAN_END = 2100
+
+# 设备型号关键字（华为 eNSP 常见，按特异性从高到低排列，需整词边界匹配）
+_MODEL_KEYWORDS = (
+    "S5700", "S3700", "S2700", "S6700", "S9300",
+    "AR", "NE", "CE", "USG", "Router", "Switch",
+)
+
+# 型号匹配正则：要求以关键字开头且后接型号数字，避免把 software 里的 "are" 误判为 AR
+_MODEL_RE = re.compile(
+    r"\b((?:S|AR|NE|CE|USG)\d{3,5}[\w\-]*)\b",
+    re.IGNORECASE,
+)
+
+# 提示符正则：<R1> 或 [R1] 或 [~R1]
+_PROMPT_RE = re.compile(r"^[<\[]~?([^>\]~]+)[>\]]$")
+
 
 class DeviceManager: 
     """管理所有网络设备的连接""" 
@@ -19,28 +41,458 @@ class DeviceManager:
         self.devices: Dict[str, dict] = {}  # name -> device info 
         self.sessions: Dict[str, Any] = {} 
         self.pool = SessionPool(max_size=config.get('pool_size', 10)) 
+        self.scan_timeout = config.get('scan_timeout', 0.3)
         
     def add_device(self, name: str, ip: str, port: int = 2000) -> bool: 
-        """添加设备信息（eNSP 专用：默认免密 Telnet）""" 
+        """添加设备信息（eNSP 专用：默认免密 Telnet）
+
+        如果同名设备已存在，则更新其地址信息而非静默覆盖失败。
+        """ 
         # eNSP 强制使用 generic_telnet 以跳过所有自动化登录探测
         device_type = 'generic_telnet'
 
+        existing = self.devices.get(name, {})
         self.devices[name] = { 
             'name': name, 
             'ip': ip, 
             'port': port, 
-            'device_type': device_type
+            'device_type': device_type,
+            'hostname': existing.get('hostname', ''),
+            'model': existing.get('model', ''),
+            'version': existing.get('version', ''),
         } 
         return True 
+
+    # ------------------------------------------------------------------
+    # 端口扫描与设备识别
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _port_is_open(ip: str, port: int, timeout: float = 0.3) -> bool:
+        """检测 TCP 端口是否开放（用于发现 eNSP 映射的串口）"""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(timeout)
+                return sock.connect_ex((ip, port)) == 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def _extract_model(text: str) -> str:
+        """从 display version 回显中提取设备型号
+
+        例如 "VRP (R) software, Version 5.170 (AR1220 V300R003C10SPC600)" -> "AR1220"
+        需避免误匹配 "software" 中的字母组合。
+        """
+        if not text:
+            return ""
+        # 优先匹配括号内的型号（华为回显中最可靠的字段）
+        m = re.search(r"\(([A-Za-z]+\d{3,5}[\w\-]*)\s", text)
+        if m:
+            return m.group(1)
+        m = _MODEL_RE.search(text)
+        return m.group(1) if m else ""
+
+    @staticmethod
+    def _extract_hostname_from_banner(text: str) -> str:
+        """从回显文本中提取提示符形式的设备名，如 <R1> / [R1]"""
+        if not text:
+            return ""
+        for line in reversed(text.splitlines()):
+            m = _PROMPT_RE.match(line.strip())
+            if m:
+                return m.group(1).strip()
+        m = re.search(r"[<\[]~?([^>\]\s~]{1,64})[>\]]", text)
+        return m.group(1).strip() if m else ""
+
+    def is_ensp_device_port(self, ip: str, port: int, timeout: float = 2.0) -> bool:
+        """判断某个开放端口背后是否为可交互的 eNSP 网络设备
+
+        判断依据：连接后发送回车，能从设备读到类似提示符的内容（<hostname> / [hostname]）。
+        普通服务端口不会有这种回显，因此可有效区分。
+        """
+        conn = None
+        try:
+            conn = ConnectHandler(
+                device_type='generic_telnet',
+                ip=ip,
+                port=port,
+                timeout=timeout,
+                conn_timeout=timeout,
+                global_delay_factor=1,
+            )
+            conn.write_channel("\n")
+            import time
+            time.sleep(0.4)
+            try:
+                banner = conn.read_channel()
+            except Exception:
+                banner = ""
+            if self._extract_hostname_from_banner(banner):
+                return True
+            try:
+                prompt = conn.find_prompt()
+                if prompt and _PROMPT_RE.match(prompt.strip()):
+                    return True
+            except Exception:
+                pass
+            return False
+        except Exception as e:
+            logger.debug(f"Port {port} is not an interactive device: {e}")
+            return False
+        finally:
+            if conn is not None:
+                try:
+                    conn.disconnect()
+                except Exception:
+                    pass
+
+    def _probe_identity(self, ip: str, port: int) -> Dict[str, str]:
+        """在扫描阶段临时连接并读取设备主机名/型号/版本，读完即断开"""
+        identity = {"hostname": "", "model": "", "version": ""}
+        conn = None
+        try:
+            conn = ConnectHandler(
+                device_type='generic_telnet',
+                ip=ip,
+                port=port,
+                timeout=5,
+                conn_timeout=5,
+            )
+            conn.write_channel("\n")
+            import time
+            time.sleep(0.4)
+            try:
+                banner = conn.read_channel()
+            except Exception:
+                banner = ""
+
+            # 主机名：优先 sysname，其次提示符
+            try:
+                out = conn.send_command_timing("display current-configuration | include sysname")
+                m = re.search(r"sysname\s+(\S+)", out or "")
+                if m:
+                    identity["hostname"] = m.group(1)
+            except Exception:
+                pass
+            if not identity["hostname"]:
+                name_from_banner = self._extract_hostname_from_banner(banner)
+                if name_from_banner:
+                    identity["hostname"] = name_from_banner
+            if not identity["hostname"]:
+                try:
+                    prompt = conn.find_prompt()
+                    m = _PROMPT_RE.match((prompt or "").strip())
+                    if m:
+                        identity["hostname"] = m.group(1).strip()
+                except Exception:
+                    pass
+
+            # 型号 / 版本
+            try:
+                ver_out = conn.send_command_timing("display version")
+                if ver_out:
+                    identity["model"] = self._extract_model(ver_out)
+                    vm = re.search(r"[Vv]ersion\s+([\w\.\(\)]+)", ver_out)
+                    if vm:
+                        identity["version"] = vm.group(1)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.debug(f"Probe identity on {ip}:{port} failed: {e}")
+        finally:
+            if conn is not None:
+                try:
+                    conn.disconnect()
+                except Exception:
+                    pass
+        return identity
+
+    def scan_devices(
+        self,
+        ip: str = "127.0.0.1",
+        start_port: int = DEFAULT_SCAN_START,
+        end_port: int = DEFAULT_SCAN_END,
+        max_workers: int = 50,
+        probe_device: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """扫描指定 IP 的端口范围，返回发现的设备列表
+
+        Args:
+            ip: 目标 IP（eNSP 默认本机 127.0.0.1）
+            start_port / end_port: 端口范围（含端点）
+            max_workers: 并发线程数
+            probe_device: 是否进一步探测端口背后是否为可交互网络设备
+
+        Returns:
+            [{"port": 2000, "hostname": "R1", "model": "AR1220",
+              "version": "...", "is_device": True}, ...]
+        """
+        if start_port > end_port:
+            start_port, end_port = end_port, start_port
+        start_port = max(1, min(int(start_port), 65535))
+        end_port = max(1, min(int(end_port), 65535))
+
+        open_ports: List[int] = []
+        ports = list(range(start_port, end_port + 1))
+        worker_count = min(max_workers, len(ports)) or 1
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_map = {
+                executor.submit(self._port_is_open, ip, p, self.scan_timeout): p
+                for p in ports
+            }
+            for future in as_completed(future_map):
+                p = future_map[future]
+                try:
+                    if future.result():
+                        open_ports.append(p)
+                except Exception:
+                    pass
+
+        open_ports.sort()
+        logger.info(f"Scan {ip}:{start_port}-{end_port} found {len(open_ports)} open ports: {open_ports}")
+
+        # 阶段二：并发探测每个开放端口（连接 + 读取身份），显著缩短总耗时
+        def probe_port(p: int) -> Dict[str, Any]:
+            entry: Dict[str, Any] = {
+                "ip": ip,
+                "port": p,
+                "hostname": "",
+                "model": "",
+                "version": "",
+                "is_device": True,
+            }
+            if probe_device:
+                entry["is_device"] = self.is_ensp_device_port(ip, p, timeout=2.0)
+                if entry["is_device"]:
+                    entry.update(self._probe_identity(ip, p))
+            return entry
+
+        if not open_ports:
+            return []
+
+        results: List[Dict[str, Any]] = []
+        probe_workers = min(max_workers, len(open_ports)) or 1
+        with ThreadPoolExecutor(max_workers=probe_workers) as executor:
+            future_map = {executor.submit(probe_port, p): p for p in open_ports}
+            for future in as_completed(future_map):
+                p = future_map[future]
+                try:
+                    results.append(future.result())
+                except Exception as e:
+                    logger.debug(f"Probe port {p} failed: {e}")
+                    results.append({
+                        "ip": ip, "port": p, "hostname": "", "model": "",
+                        "version": "", "is_device": False,
+                    })
+
+        results.sort(key=lambda r: r["port"])
+        return results
+
+    def _read_device_identity(self, name: str) -> Dict[str, str]:
+        """从已连接设备读取身份信息（主机名 / 型号 / 版本）
+
+        返回 {"hostname": ..., "model": ..., "version": ...}，读取失败的字段为空串。
+        """
+        identity = {"hostname": "", "model": "", "version": ""}
+        conn = self.connect(name)
+        if not conn:
+            return identity
+
+        # 1) 主机名：优先 sysname，其次提示符
+        try:
+            out = conn.send_command_timing("display current-configuration | include sysname")
+            m = re.search(r"sysname\s+(\S+)", out or "")
+            if m:
+                identity["hostname"] = m.group(1).strip()
+        except Exception as e:
+            logger.debug(f"sysname read failed on {name}: {e}")
+
+        if not identity["hostname"]:
+            try:
+                prompt = conn.find_prompt()
+                m = _PROMPT_RE.match((prompt or "").strip())
+                if m:
+                    identity["hostname"] = m.group(1).strip()
+            except Exception as e:
+                logger.debug(f"find_prompt failed on {name}: {e}")
+
+        if not identity["hostname"]:
+            identity["hostname"] = name
+
+        # 2) 型号与版本
+        try:
+            ver_out = conn.send_command_timing("display version")
+            if ver_out:
+                identity["model"] = self._extract_model(ver_out)
+                vm = re.search(r"[Vv]ersion\s+([\w\.\(\)]+)", ver_out)
+                if vm:
+                    identity["version"] = vm.group(1)
+        except Exception as e:
+            logger.debug(f"display version failed on {name}: {e}")
+
+        return identity
+
+    def refresh_device_name(self, name: str) -> Optional[str]:
+        """读取设备的真实主机名；若与当前键不同则重命名设备（迁移连接与元数据）
+
+        Returns:
+            新的设备名；失败返回 None。
+        """
+        identity = self._read_device_identity(name)
+        new_name = (identity.get("hostname") or "").strip() or name
+
+        # 无论是否改名，都把主机名/型号写回设备信息
+        if name in self.devices:
+            self.devices[name].update({k: v for k, v in identity.items() if v})
+
+        if new_name == name:
+            return name
+
+        # 目标名称已被其他设备占用
+        if new_name in self.devices:
+            logger.warning(f"Cannot rename {name} -> {new_name}: name already in use")
+            return None
+
+        # 迁移设备信息与连接
+        info = self.devices.pop(name)
+        info["name"] = new_name
+        self.devices[new_name] = info
+
+        if name in self.sessions:
+            self.sessions[new_name] = self.sessions.pop(name)
+            self.pool.remove(name)
+            self.pool.add(new_name, self.sessions[new_name])
+
+        logger.info(f"Device renamed: {name} -> {new_name}")
+        return new_name
+
+    def scan_and_add(
+        self,
+        ip: str = "127.0.0.1",
+        start_port: int = DEFAULT_SCAN_START,
+        end_port: int = DEFAULT_SCAN_END,
+        selected_ports: Optional[List[int]] = None,
+        name_prefix: str = "R",
+        use_hostname: bool = True,
+        scanned: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """扫描端口并批量添加设备（可由 UI 传入已扫描结果与勾选端口）
+
+        Args:
+            selected_ports: 若提供，则只添加这些端口；否则添加扫描到的全部设备端口。
+            name_prefix: 自动命名前缀（如 "R"），与序号拼接。
+            use_hostname: 优先使用设备真实主机名命名。
+            scanned: 复用已有扫描结果，避免重复扫描。
+
+        Returns:
+            实际添加的设备信息列表。
+        """
+        if scanned is None:
+            scanned = self.scan_devices(ip, start_port, end_port)
+
+        candidates = [d for d in scanned if d.get("is_device")]
+        if selected_ports is not None:
+            selected_set = set(selected_ports)
+            candidates = [d for d in candidates if d["port"] in selected_set]
+
+        added: List[Dict[str, Any]] = []
+        for idx, cand in enumerate(candidates, start=1):
+            port = cand["port"]
+            hostname = (cand.get("hostname") or "").strip()
+
+            candidates_names: List[str] = []
+            if use_hostname and hostname:
+                candidates_names.append(hostname)
+            # 前缀+序号 作为回退；序号取该候选在本次列表中的位置
+            candidates_names.append(f"{name_prefix or 'DEV'}{idx}")
+            # 最后用「前缀+端口」兜底，保证唯一
+            candidates_names.append(f"{name_prefix or 'DEV'}{port}")
+
+            dev_name = ""
+            for cand_name in candidates_names:
+                if cand_name not in self.devices:
+                    dev_name = cand_name
+                    break
+                # 同名且地址相同 -> 已存在，跳过
+                existing = self.devices[cand_name]
+                if existing.get("ip") == ip and existing.get("port") == port:
+                    dev_name = ""
+                    break
+            if not dev_name:
+                continue  # 已存在该设备
+
+            self.add_device(dev_name, ip, port)
+            self.devices[dev_name].update({
+                "hostname": hostname or dev_name,
+                "model": cand.get("model", ""),
+                "version": cand.get("version", ""),
+            })
+            added.append({"name": dev_name, **cand})
+
+        logger.info(f"scan_and_add added {len(added)} devices: {[a['name'] for a in added]}")
+        return added
     
     def remove_device(self, name: str) -> bool: 
         """移除设备并断开连接""" 
         if name in self.sessions: 
             self.disconnect(name) 
         return self.devices.pop(name, None) is not None 
+
+    def list_devices(self) -> List[dict]:
+        """返回当前已注册设备信息列表（副本，供 UI/执行器消费）"""
+        return [dict(info) for info in self.devices.values()]
+
+    def resolve_device_name(self, name: str) -> Optional[str]:
+        """把任务中的设备名解析为实际已配置的设备键
+
+        AI 解析出的设备名（如 R1）可能与用户实际配置的设备键（如 OSPF-Core1）
+        不一致，或大小写有差异。这里按优先级尝试匹配：
+        1) 精确匹配设备键
+        2) 忽略大小写匹配设备键
+        3) 匹配设备的 hostname 字段（忽略大小写）
+        4) 数字序号启发式：若请求形如 R1/R2，且存在唯一设备的键/hostname 中含相同数字，则匹配
+        """
+        if not name:
+            return None
+        if name in self.devices:
+            return name
+        lower = name.strip().lower()
+        for key in self.devices:
+            if key.lower() == lower:
+                return key
+        for key, info in self.devices.items():
+            if (info.get("hostname") or "").strip().lower() == lower:
+                return key
+
+        # 4) 数字序号启发式：R1 -> 唯一含 "1" 的设备名
+        m = re.fullmatch(r"([a-zA-Z]*)(\d+)", lower)
+        if m:
+            digits = m.group(2)
+            matches = [
+                key for key in self.devices
+                if re.search(rf"\b{re.escape(m.group(1))}{digits}\b", key, re.IGNORECASE)
+                or (self.devices[key].get("hostname") or "").lower().endswith(digits)
+            ]
+            if len(matches) == 1:
+                return matches[0]
+        return None
+
+    def resolve_device_names(self, names: List[str]) -> Dict[str, str]:
+        """批量解析设备名，返回 {原始名: 解析后的设备键}（未解析到的值为 None）"""
+        return {n: self.resolve_device_name(n) for n in names}
     
     def connect(self, name: str) -> Optional[Any]: 
-        """建立设备连接""" 
+        """建立设备连接（支持按设备键或主机名解析）""" 
+        # 统一解析设备名，兼容 AI 解析出的名称与实际配置名不一致的情况
+        resolved = self.resolve_device_name(name)
+        if resolved is None:
+            logger.error(f"Device {name} not found")
+            return None
+        if resolved != name:
+            logger.info(f"Device name '{name}' resolved to '{resolved}'")
+        name = resolved
+
         if name in self.sessions: 
             return self.sessions[name] 
         
@@ -121,30 +573,235 @@ class DeviceManager:
             return True 
         return False 
     
+    # ------------------------------------------------------------------
+    # 会话状态恢复与分屏控制
+    # ------------------------------------------------------------------
+    def _is_paging(self, conn) -> bool:
+        """检测会话是否卡在 '---- More ----' 分屏暂停状态"""
+        try:
+            prompt = conn.find_prompt()
+        except Exception:
+            return False
+        return bool(prompt and "More" in prompt)
+
+    def recover_session(self, conn, name: str = "") -> None:
+        """把会话恢复到用户视图（<hostname>），并解除分屏暂停/配置模式
+
+        eNSP 的 VRP 在长输出时会停在 '---- More ----'，此时提示符不再是 <hostname>，
+        后续所有 send_command 都会因提示符不匹配而超时。这里统一做恢复：
+        1) 若处于分屏状态，发送空格翻到底；
+        2) 若处于配置模式（[hostname] 或 [~hostname]），发送 return 退出。
+        """
+        # 1) 解除分屏暂停
+        for _ in range(120):
+            if not self._is_paging(conn):
+                break
+            try:
+                conn.write_channel(" ")
+            except Exception:
+                break
+            import time
+            time.sleep(0.05)
+
+        # 2) 退出配置模式
+        try:
+            prompt = conn.find_prompt()
+        except Exception:
+            prompt = ""
+        for _ in range(5):
+            if not prompt or not prompt.strip().startswith("["):
+                break
+            try:
+                conn.write_channel("return\n")
+            except Exception:
+                break
+            import time
+            time.sleep(0.3)
+            try:
+                prompt = conn.find_prompt()
+            except Exception:
+                break
+
+    def read_long_output(self, conn, command: str, name: str = "", 
+                         max_pages: int = 500, idle_limit: int = 8) -> str:
+        """读取长输出命令的完整回显，自动翻页（处理 '---- More ----'）
+
+        eNSP/VRP 在输出较长时会暂停并显示 '---- More ----'，此时必须发送空格继续，
+        否则只能拿到第一页。本方法通过「读缓冲 + 遇 More 发空格 + 连续空闲判定结束」
+        的方式拿到完整输出。
+        """
+        import time
+        self.recover_session(conn, name)
+        try:
+            conn.write_channel(command + "\n")
+        except Exception as e:
+            logger.error(f"write_channel '{command}' on {name} failed: {e}")
+            return ""
+
+        buf = ""
+        idle = 0
+        empty_total = 0
+        for _ in range(max_pages):
+            try:
+                chunk = conn.read_channel()
+            except Exception:
+                chunk = ""
+            if chunk:
+                idle = 0
+                buf += chunk
+                # 只要还停留在分屏暂停页，就继续翻页
+                if "---- More ----" in chunk:
+                    try:
+                        conn.write_channel(" ")
+                    except Exception:
+                        break
+                    time.sleep(0.15)
+                continue
+            idle += 1
+            empty_total += 1
+            # 连续多次读不到数据，且已回到用户视图提示符，则认为输出结束
+            tail = buf[-60:]
+            if idle >= idle_limit and "<" in tail and "More" not in tail:
+                break
+            # 全程一个字符都没读到，且已空转较久：不必再等下去（避免空连接阻塞）
+            if not buf and empty_total >= idle_limit:
+                logger.warning(f"No output received for '{command}' on {name}")
+                break
+            time.sleep(0.08)
+
+        # 兜底：若仍卡在分屏，尝试退出
+        if "---- More ----" in buf[-40:]:
+            try:
+                conn.write_channel("q")
+            except Exception:
+                pass
+        self.recover_session(conn, name)
+        return buf
+
     def execute_command(self, name: str, command: str) -> Optional[str]: 
-        """在设备上执行命令""" 
+        """在设备上执行查询命令并返回输出
+
+        针对 eNSP/VRP 做了健壮性处理：
+        - 执行前恢复会话（解除分屏 / 退出配置模式）
+        - 长输出命令走自动翻页读取，避免只拿到第一页
+        - 短命令走 timing 模式（不依赖提示符正则，适配主机名与配置名不一致的情况）
+        """
         conn = self.connect(name) 
         if not conn: 
-            return None 
+            return None
+
+        long_output = any(k in command for k in (
+            "current-configuration", "display version", "display interface",
+            "display ip routing-table", "display arp", "display mac-address",
+            "display lldp",
+        ))
+
+        if long_output:
+            raw = self.read_long_output(conn, command, name)
+            return self._clean_output(raw, command)
+
+        # 恢复会话状态，避免因残留分屏/配置模式导致命令超时
+        self.recover_session(conn, name)
         try: 
-            output = conn.send_command(command) 
-            return output 
+            output = conn.send_command_timing(
+                command, read_timeout=20, last_read=1.0,
+            )
+            self.recover_session(conn, name)
+            return self._clean_output(output, command)
         except Exception as e: 
             logger.error(f"Command '{command}' on {name} failed: {e}") 
-            return None 
+            try:
+                self.recover_session(conn, name)
+            except Exception:
+                pass
+            return None
+
+    @staticmethod
+    def _clean_output(output: Optional[str], command: str) -> Optional[str]:
+        """清理回显：去掉分屏提示、ANSI 控制序列、命令回显与尾部提示符"""
+        if output is None:
+            return None
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="ignore")
+
+        # 去掉 '---- More ----' 及其后的退格对齐控制序列
+        output = re.sub(r"\s*-+\s*More\s*-+.*?(?:\x1b\[\d+D\s*)+", "\n", output)
+        output = re.sub(r"-+\s*More\s*-+", "", output)
+        # 去掉 ANSI 转义序列（如 \x1b[42D）
+        output = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", output)
+        # 去掉回显的 screen-length 等辅助命令行
+        output = re.sub(r"^\s*screen-length[^\n]*\n?", "", output)
+
+        # 去掉命令回显：eNSP 回显常形如 "<R1>display xxx" 或 "[R1]vlan 10"，
+        # 提示符与命令可能出现在行首或跟在其它提示符之后（中间无换行）。
+        cmd_pat = re.escape(command.strip())
+        prompt_pat = r"[<\[]~?[\w\-\.]+[>\]]"
+        # 1) 行首带提示符的命令回显
+        output = re.sub(rf"(?m)^\s*{prompt_pat}\s*{cmd_pat}\s*$", "", output)
+        # 2) 提示符后紧跟我方命令（去除整段 "提示符+命令"）
+        output = re.sub(rf"{prompt_pat}\s*{cmd_pat}", "", output)
+        # 3) 残留的裸命令回显（首行无提示符时）
+        output = re.sub(rf"(?m)^\s*{cmd_pat}\s*$", "", output)
+        # 4) 清理行首孤立提示符残留（如 "<R1>" 单独成串）
+        output = re.sub(rf"{prompt_pat}", "", output)
+
+        lines = output.splitlines()
+        cleaned = []
+        for line in lines:
+            stripped = line.rstrip()
+            # 跳过清理后变为空的行（原命令回显行）
+            if not stripped.strip():
+                continue
+            cleaned.append(stripped)
+
+        result = "\n".join(cleaned)
+        return result.strip("\r\n")
     
     def execute_config_commands(self, name: str, commands: List[str]) -> bool: 
-        """在设备上执行配置命令列表""" 
+        """在设备上执行配置命令列表
+
+        说明：eNSP 的 Huawei VRP 通过 generic_telnet 连接时，send_config_set 常常
+        无法正确识别提示符（尤其是主机名与配置名不一致、残留分屏、或退出 system-view
+        时），因此改为「先恢复会话状态 + 逐条 timing 下发」，最大程度保证配置落地。
+        """
         conn = self.connect(name) 
         if not conn: 
-            return False 
-        try: 
-            output = conn.send_config_set(commands) 
-            logger.debug(f"Config result on {name}: {output}") 
-            return True 
-        except Exception as e: 
-            logger.error(f"Config on {name} failed: {e}") 
-            return False 
+            return False
+
+        # 执行前先恢复会话（解除分屏 / 退出配置模式），避免首条命令就超时
+        self.recover_session(conn, name)
+
+        # 过滤空行与注释行
+        cmds = [c.strip() for c in commands if c and c.strip() and not c.strip().startswith(("#", "//", "!"))]
+        if not cmds:
+            return True
+
+        ok = True
+        for cmd in cmds:
+            try:
+                conn.send_command_timing(
+                    cmd, strip_prompt=False, strip_command=False, read_timeout=15,
+                )
+            except Exception as e:
+                logger.warning(f"send_command_timing '{cmd}' on {name} failed ({e}); retrying via send_config_set")
+                # 单条兜底：用 send_config_set 再试一次
+                try:
+                    conn.send_config_set([cmd], exit_config_mode=False)
+                except Exception as e2:
+                    logger.error(f"Config command '{cmd}' on {name} failed: {e2}")
+                    ok = False
+
+        # 执行后退出配置模式并恢复分屏设置
+        self._ensure_privileged_mode(conn, name)
+        logger.info(f"Config on {name} executed ({len(cmds)} commands), success={ok}")
+        return ok
+
+    def _ensure_privileged_mode(self, conn, name: str) -> None:
+        """确保设备回到用户视图（<hostname>），避免卡在配置模式或分屏"""
+        try:
+            self.recover_session(conn, name)
+        except Exception as e:
+            logger.debug(f"Failed to normalize prompt on {name}: {e}")
     
     def get_all_connected(self) -> List[str]: 
         """返回当前已连接的设备列表""" 
@@ -167,15 +824,12 @@ class DeviceManager:
             return {cmd: None for cmd in commands}
 
         for cmd in commands:
-            try:
-                if is_config:
-                    output = conn.send_config_set([cmd])
-                else:
-                    output = conn.send_command(cmd)
-                results[cmd] = output
-            except Exception as e:
-                logger.error(f"Command '{cmd}' on {name} failed: {e}")
-                results[cmd] = None
+            if is_config:
+                # 配置命令：直接复用 execute_config_commands 的健壮路径
+                ok = self.execute_config_commands(name, [cmd])
+                results[cmd] = "配置已下发" if ok else None
+            else:
+                results[cmd] = self.execute_command(name, cmd)
 
         return results
 
@@ -204,15 +858,11 @@ class DeviceManager:
 
             dev_res: Dict[str, Optional[str]] = {}
             for cmd in commands:
-                try:
-                    if is_config:
-                        output = conn.send_config_set([cmd])
-                    else:
-                        output = conn.send_command(cmd)
-                    dev_res[cmd] = output
-                except Exception as e:
-                    logger.error(f"Command '{cmd}' on {dev_name} failed: {e}")
-                    dev_res[cmd] = None
+                if is_config:
+                    ok = self.execute_config_commands(dev_name, [cmd])
+                    dev_res[cmd] = "配置已下发" if ok else None
+                else:
+                    dev_res[cmd] = self.execute_command(dev_name, cmd)
             return dev_res
 
         # 限制最大并发，避免对 eNSP/本机造成过大压力
@@ -239,15 +889,23 @@ class DeviceManager:
         如果检测到未启用或无法确认状态，则尝试下发全局 lldp enable。
         返回 True 表示最终认为已启用（或命令下发成功），False 表示失败。
         """
+        # 先确认设备可达
+        conn = self.connect(name)
+        if not conn:
+            logger.error(f"Cannot connect to {name} for LLDP check")
+            return False
+
         # 尝试通过查询命令判断 LLDP 是否可用
         check_cmd = "display lldp local"
         output = self.execute_command(name, check_cmd)
         if output:
             text = output.lower()
-            # 粗略判断：存在关键字段且没有明显错误提示，则认为已启用
-            if ("lldp" in text and "enable" in text) and not any(
-                kw in text for kw in ["unrecognized command", "error", "not enabled"]
-            ):
+            # 明确报错：命令不存在 -> 无法启用
+            if "unrecognized command" in text or "wrong parameter" in text:
+                logger.warning(f"Device {name} does not support lldp command ('{check_cmd}')")
+                return False
+            # 已启用：输出中包含 LLDP 相关字段，且无未启用提示
+            if "lldp" in text and "not enabled" not in text and "disabled" not in text:
                 logger.info(f"LLDP already enabled on {name}")
                 return True
 
@@ -258,7 +916,6 @@ class DeviceManager:
             [
                 "system-view",
                 "lldp enable",
-                "quit",
             ],
         )
         if not ok:

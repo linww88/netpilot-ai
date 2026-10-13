@@ -10,7 +10,6 @@ matplotlib
 textfsm
 pandas
 requests
-sqlite3
 langchain
 langchain-openai
 langchain-community

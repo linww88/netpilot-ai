@@ -1,6 +1,6 @@
 # 应用配置 
 app: 
-  name: eNSP AI Assistant 
+  name: NetPilot eNSP AI 网络助手 
   version: 0.1.0 
 
 # 设备连接默认参数 
@@ -11,27 +11,47 @@ connection:
   pool_size: 10 
   retry_attempts: 3 
   retry_delay: 2 
+  # 端口扫描（用于自动发现 eNSP 设备）
+  scan_ip: 127.0.0.1 
+  scan_start_port: 2000 
+  scan_end_port: 2100 
+  scan_timeout: 0.3            # 单端口探测超时（秒）
+  scan_max_workers: 50         # 扫描并发数
 
-# LLM配置 
+# LLM配置（默认使用 DeepSeek）
 # provider 可选：
+# - deepseek         使用 DeepSeek 官方接口（默认）
 # - openai           使用官方 OpenAI 接口
 # - openai_compatible 使用兼容 OpenAI 协议的国产/第三方云（需配置 base_url）
 # - local            使用本地大模型（例如 Ollama）
 llm: 
-  provider: openai 
-  model: gpt-3.5-turbo 
+  provider: deepseek 
+  model: deepseek-chat 
   temperature: 0.2 
   max_tokens: 1000 
-  api_key_env: OPENAI_API_KEY  # 从环境变量读取 
-  base_url: ""                  # OpenAI 兼容接口地址（例如 https://api.xxx.com/v1），为空则使用默认 
+  api_key_env: DEEPSEEK_API_KEY   # 从该环境变量读取 API Key（在 .env 中配置）
+  api_key: ""                     # ⚠️ 请勿在此填写真实 Key（该文件会提交到 Git）；请填写到 .env 的 DEEPSEEK_API_KEY
+  base_url: "https://api.deepseek.com"   # DeepSeek OpenAI 兼容接口地址，为空则使用默认 
 
 # 预置模型选项（可在前端下拉选择，便于快速接入常见「零门槛/免费额度」模型）
 llm_presets:
   - name: "自定义（使用 config.yaml 配置）"
     provider: deepseek
-    model: gpt-3.5-turbo
-    api_key_env: OPENAI_API_KEY
-    base_url: ""
+    model: deepseek-chat
+    api_key_env: DEEPSEEK_API_KEY
+    base_url: "https://api.deepseek.com"
+
+  - name: "DeepSeek Chat（deepseek-chat）"
+    provider: deepseek
+    model: deepseek-chat
+    api_key_env: DEEPSEEK_API_KEY
+    base_url: "https://api.deepseek.com"
+
+  - name: "DeepSeek Reasoner（deepseek-reasoner）"
+    provider: deepseek
+    model: deepseek-reasoner
+    api_key_env: DEEPSEEK_API_KEY
+    base_url: "https://api.deepseek.com"
 
   - name: "本地 Ollama 免费模型"
     provider: local
@@ -39,7 +59,7 @@ llm_presets:
 
   - name: "OpenAI 兼容服务示例（可填国内/第三方免费服务）"
     provider: openai_compatible
-    model: gpt-3.5-turbo
+    model: deepseek-chat
     api_key_env: COMPATIBLE_API_KEY
     base_url: ""  # 按服务商文档填写，例如 https://api.xxx.com/v1
 

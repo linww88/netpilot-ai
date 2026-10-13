@@ -18,8 +18,22 @@
 - action: 操作类型 
 - parameters: 参数字典 
 
-示例： 
+重要规则：
+1. 即使用户指令中提到的设备未出现在拓扑信息里，也必须根据指令文本中出现的设备名（如 R1、R2、SW1）进行解析，不要返回空数组。
+2. 一条指令涉及多台设备时，为每台设备各生成一个任务对象。
+3. 如果用户的意图是在两台设备之间建立协议（例如“在R1和R2之间配置OSPF”），应为两台设备分别生成对应的配置任务。
+4. 只输出 JSON，禁止使用 ``` 代码块包裹，禁止输出任何解释文字。
+
+示例1： 
 用户指令：在R1的G0/0/1配置IP 10.0.0.1/24 
 输出：[{{"device": "R1", "action": "config_interface", "parameters": {{"interface": "G0/0/1", "ip": "10.0.0.1", "mask": "24"}}}}] 
 
-只输出JSON，不要其他内容。
+示例2： 
+用户指令：在R1和R2之间配置OSPF 
+输出：[{{"device": "R1", "action": "config_ospf", "parameters": {{"process": 1, "area": 0}}}}, {{"device": "R2", "action": "config_ospf", "parameters": {{"process": 1, "area": 0}}}}] 
+
+示例3： 
+用户指令：查看R1的路由表 
+输出：[{{"device": "R1", "action": "show_command", "parameters": {{"command": "display ip routing-table"}}}}] 
+
+只输出JSON数组，不要其他内容。

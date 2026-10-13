@@ -1,6 +1,14 @@
 import streamlit as st
 import networkx as nx
 import matplotlib.pyplot as plt
+from matplotlib import rcParams
+
+# 中文标签在 matplotlib 默认字体下会显示为方块，这里尝试启用系统中文字体
+rcParams['font.sans-serif'] = [
+    'Microsoft YaHei', 'SimHei', 'SimSun', 'DejaVu Sans'
+]
+rcParams['axes.unicode_minus'] = False
+
 
 def visualize_topology(graph: nx.Graph):
     """可视化网络拓扑图"""
@@ -10,8 +18,14 @@ def visualize_topology(graph: nx.Graph):
 
     fig, ax = plt.subplots(figsize=(10, 8))
     
-    # 获取节点标签（优先使用 hostname）
-    labels = {node: data.get('hostname', node) for node, data in graph.nodes(data=True)}
+    # 获取节点标签：以设备键为主，若 hostname 与键不同则一并标注
+    labels = {}
+    for node, data in graph.nodes(data=True):
+        hostname = data.get('hostname')
+        if hostname and hostname != node:
+            labels[node] = f"{node}\n({hostname})"
+        else:
+            labels[node] = node
     
     # 布局算法
     pos = nx.spring_layout(graph, seed=42)
@@ -23,7 +37,7 @@ def visualize_topology(graph: nx.Graph):
     nx.draw_networkx_edges(graph, pos, width=2, edge_color='gray', ax=ax)
     
     # 绘制标签
-    nx.draw_networkx_labels(graph, pos, labels=labels, font_size=12, font_family='sans-serif', ax=ax)
+    nx.draw_networkx_labels(graph, pos, labels=labels, font_size=10, ax=ax)
     
     # 绘制边标签（端口信息）
     edge_labels = {}
@@ -33,7 +47,8 @@ def visualize_topology(graph: nx.Graph):
         if local_port or remote_port:
             edge_labels[(u, v)] = f"{local_port} <-> {remote_port}"
     
-    nx.draw_networkx_edge_labels(graph, pos, edge_labels=edge_labels, font_size=8, ax=ax)
+    if edge_labels:
+        nx.draw_networkx_edge_labels(graph, pos, edge_labels=edge_labels, font_size=8, ax=ax)
     
     ax.set_title("Network Topology Map")
     ax.axis('off')

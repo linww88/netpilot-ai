@@ -3,6 +3,7 @@ import streamlit as st
 import yaml 
 import os 
 import sys
+import time
 from dotenv import load_dotenv 
 
 # 解决 ModuleNotFoundError: No module named 'src'
@@ -49,13 +50,13 @@ if 'last_parsed_tasks' not in st.session_state:
 default_llm_cfg = config.get('llm', {})
 llm_presets = config.get('llm_presets', [])
 if 'llm_provider' not in st.session_state:
-    st.session_state['llm_provider'] = default_llm_cfg.get('provider', 'openai')
+    st.session_state['llm_provider'] = default_llm_cfg.get('provider', 'deepseek')
 if 'llm_model' not in st.session_state:
-    st.session_state['llm_model'] = default_llm_cfg.get('model', 'gpt-3.5-turbo')
+    st.session_state['llm_model'] = default_llm_cfg.get('model', 'deepseek-chat')
 if 'llm_base_url' not in st.session_state:
-    st.session_state['llm_base_url'] = default_llm_cfg.get('base_url', '')
+    st.session_state['llm_base_url'] = default_llm_cfg.get('base_url', 'https://api.deepseek.com')
 if 'llm_api_key_env' not in st.session_state:
-    st.session_state['llm_api_key_env'] = default_llm_cfg.get('api_key_env', 'OPENAI_API_KEY')
+    st.session_state['llm_api_key_env'] = default_llm_cfg.get('api_key_env', 'DEEPSEEK_API_KEY')
 if 'llm_preset_name' not in st.session_state:
     st.session_state['llm_preset_name'] = "自定义（使用 config.yaml 配置）"
 if 'use_web_search' not in st.session_state:
@@ -66,6 +67,7 @@ if 'use_web_search' not in st.session_state:
 with st.sidebar:
     st.subheader("🤖 AI & 搜索配置")
     provider_labels = {
+        "deepseek": "DeepSeek 官方接口（默认）",
         "openai": "在线 OpenAI / 兼容接口",
         "openai_compatible": "OpenAI 兼容 API（国内/第三方）",
         "local": "本地大模型 (Ollama)",
@@ -99,7 +101,7 @@ with st.sidebar:
                 break
 
     current_provider = st.session_state['llm_provider']
-    current_label = provider_labels.get(current_provider, provider_labels['openai'])
+    current_label = provider_labels.get(current_provider, provider_labels['deepseek'])
     selected_label = st.selectbox(
         "LLM 提供方",
         options=list(provider_labels.values()),
@@ -111,14 +113,14 @@ with st.sidebar:
     st.session_state['llm_model'] = st.text_input(
         "模型名称",
         value=st.session_state['llm_model'],
-        help="例如 gpt-3.5-turbo、gpt-4o、qwen-max、glm-4 等",
+        help="例如 deepseek-chat、deepseek-reasoner、gpt-4o、qwen-max、glm-4 等",
     )
 
-    if st.session_state['llm_provider'] in ('openai', 'openai_compatible'):
+    if st.session_state['llm_provider'] in ('deepseek', 'openai', 'openai_compatible'):
         st.session_state['llm_base_url'] = st.text_input(
             "OpenAI 兼容 Base URL（可选）",
             value=st.session_state['llm_base_url'],
-            help="例如 https://api.openai.com/v1 或 第三方兼容接口地址；留空使用默认。",
+            help="例如 https://api.deepseek.com 或第三方兼容接口地址；留空使用默认。",
         )
 
     st.session_state['use_web_search'] = st.checkbox(
@@ -162,13 +164,116 @@ llm_overrides = {
 device_manager, llm_client, intent_parser, command_gen, executor, tester, diagnosis, db_manager, topo_collector, topo_builder = init_components(llm_overrides)
 
 # Streamlit 界面布局
-st.set_page_config(page_title="eNSP AI Assistant", layout="wide", page_icon="🧠") 
-st.title("� eNSP AI 配置助手") 
+st.set_page_config(page_title="NetPilot eNSP AI 网络助手", layout="wide", page_icon="🧠") 
+st.title("🧠 NetPilot eNSP AI 网络助手") 
 
 # 侧边栏：设备管理 
+_scan_cfg = config.get('connection', {})
 with st.sidebar: 
     st.header("🏢 设备管理") 
+
+    # ---- 端口扫描自动发现 ----
+    with st.expander("🔍 扫描添加设备（自动发现）", expanded=False):
+        st.caption("扫描本机 eNSP 映射端口，自动识别设备并读取主机名命名。")
+        scan_ip = st.text_input("扫描 IP", value=_scan_cfg.get('scan_ip', '127.0.0.1'), key="scan_ip")
+        c1, c2 = st.columns(2)
+        with c1:
+            scan_start = st.number_input(
+                "起始端口", min_value=1, max_value=65535,
+                value=int(_scan_cfg.get('scan_start_port', 2000)), step=1, key="scan_start",
+            )
+        with c2:
+            scan_end = st.number_input(
+                "结束端口", min_value=1, max_value=65535,
+                value=int(_scan_cfg.get('scan_end_port', 2100)), step=1, key="scan_end",
+            )
+        use_hostname = st.checkbox("用设备主机名命名（推荐）", value=True, key="scan_use_hostname")
+        name_prefix = st.text_input(
+            "命名前缀（未取到主机名时使用）", value="R", key="scan_prefix",
+            help="例如前缀 R，将依次命名为 R1、R2……",
+        )
+
+        if st.button("🚀 开始扫描", use_container_width=True, key="btn_scan"):
+            if scan_start > scan_end:
+                st.error("起始端口不能大于结束端口")
+            else:
+                with st.spinner(f"正在扫描 {scan_ip}:{scan_start}-{scan_end} ..."):
+                    try:
+                        found = device_manager.scan_devices(
+                            ip=scan_ip,
+                            start_port=int(scan_start),
+                            end_port=int(scan_end),
+                            max_workers=int(_scan_cfg.get('scan_max_workers', 50)),
+                        )
+                        st.session_state['scan_results'] = found
+                    except Exception as e:
+                        st.error(f"扫描失败：{e}")
+                        st.session_state['scan_results'] = []
+
+        # 展示扫描结果，供勾选批量添加
+        scan_results = st.session_state.get('scan_results')
+        if scan_results is not None:
+            dev_ports = [r for r in scan_results if r.get('is_device')]
+            other_ports = [r for r in scan_results if not r.get('is_device')]
+            if not scan_results:
+                st.warning("该端口范围内未发现任何开放端口。请确认 eNSP 设备已启动并开启了端口映射。")
+            else:
+                st.success(
+                    f"扫描完成：共 {len(scan_results)} 个开放端口，"
+                    f"其中 {len(dev_ports)} 个识别为网络设备。"
+                )
+                if other_ports:
+                    st.caption(
+                        "以下开放端口未识别为设备（可能是其他服务）："
+                        + ", ".join(str(r['port']) for r in other_ports)
+                    )
+                if dev_ports:
+                    selectable = {}
+                    for r in dev_ports:
+                        label = f"端口 {r['port']}"
+                        if r.get('hostname'):
+                            label += f" · 主机名 {r['hostname']}"
+                        if r.get('model'):
+                            label += f" · {r['model']}"
+                        selectable[label] = r['port']
+                    chosen_labels = st.multiselect(
+                        "选择要添加的设备", options=list(selectable.keys()),
+                        default=list(selectable.keys()), key="scan_selected",
+                    )
+                    chosen_ports = [selectable[l] for l in chosen_labels]
+                    if st.button("➕ 添加所选设备", type="primary",
+                                 use_container_width=True, key="btn_scan_add"):
+                        if not chosen_ports:
+                            st.warning("请至少选择一个设备")
+                        else:
+                            added = device_manager.scan_and_add(
+                                ip=scan_ip,
+                                start_port=int(scan_start),
+                                end_port=int(scan_end),
+                                selected_ports=chosen_ports,
+                                name_prefix=name_prefix or "DEV",
+                                use_hostname=use_hostname,
+                                scanned=scan_results,
+                            )
+                            for a in added:
+                                db_manager.add_device(
+                                    a['name'], scan_ip, a['port'], 'generic_telnet',
+                                    hostname=a.get('hostname', ''),
+                                    model=a.get('model', ''),
+                                    version=a.get('version', ''),
+                                )
+                            if added:
+                                names = ", ".join(a['name'] for a in added)
+                                st.success(f"已添加 {len(added)} 台设备：{names}")
+                            else:
+                                st.info("所选设备均已存在，无需重复添加。")
+                            st.rerun()
+
+    st.divider()
+
+    # ---- 手动添加 ----
     with st.form("add_device"): 
+        st.caption("✍️ 手动添加")
         name = st.text_input("设备名", placeholder="例如: R1") 
         ip_addr = st.text_input("IP地址", value="127.0.0.1") 
         port = st.number_input("Telnet端口", value=2000, step=1) 
@@ -188,12 +293,66 @@ with st.sidebar:
     if not devices_list:
         st.info("暂无设备，请先添加")
     else:
+        col_r1, col_r2 = st.columns(2)
+        with col_r1:
+            if st.button("🔄 读取信息并重命名", use_container_width=True, key="btn_refresh_all",
+                         help="连接各设备，读取主机名后自动重命名，并刷新型号信息"):
+                with st.spinner("正在读取设备信息..."):
+                    renamed, failed = [], []
+                    for dev_name in list(device_manager.devices.keys()):
+                        try:
+                            new_name = device_manager.refresh_device_name(dev_name)
+                            if new_name and new_name != dev_name:
+                                info = device_manager.devices[new_name]
+                                db_manager.delete_device(dev_name)
+                                db_manager.add_device(
+                                    new_name, info['ip'], info['port'], info['device_type'],
+                                    hostname=info.get('hostname', ''),
+                                    model=info.get('model', ''),
+                                    version=info.get('version', ''),
+                                )
+                                renamed.append(f"{dev_name}→{new_name}")
+                            elif new_name:
+                                info = device_manager.devices[dev_name]
+                                db_manager.add_device(
+                                    dev_name, info['ip'], info['port'], info['device_type'],
+                                    hostname=info.get('hostname', ''),
+                                    model=info.get('model', ''),
+                                    version=info.get('version', ''),
+                                )
+                        except Exception as e:
+                            failed.append(f"{dev_name}({e})")
+                if renamed:
+                    st.success("已重命名：" + ", ".join(renamed))
+                if failed:
+                    st.warning("以下设备读取失败：" + ", ".join(failed))
+                st.rerun()
+        with col_r2:
+            if st.button("🔌 连接全部", use_container_width=True, key="btn_connect_all"):
+                ok, bad = [], []
+                for dev_name in list(device_manager.devices.keys()):
+                    if device_manager.connect(dev_name):
+                        ok.append(dev_name)
+                    else:
+                        bad.append(dev_name)
+                if ok:
+                    st.success(f"已连接 {len(ok)} 台：{', '.join(ok)}")
+                if bad:
+                    st.warning(f"连接失败：{', '.join(bad)}")
+
         connected_devices = device_manager.get_all_connected()
         for dev_name in list(devices_list): 
             status_label = "🟢 已连接" if dev_name in connected_devices else "🔴 未连接"
-            with st.expander(f"{status_label} | 🖥️ {dev_name}"):
-                info = device_manager.devices[dev_name]
+            info = device_manager.devices[dev_name]
+            meta = ""
+            if info.get('model'):
+                meta = f" · {info['model']}"
+            with st.expander(f"{status_label} | 🖥️ {dev_name}{meta}"):
                 st.caption(f"类型: {info['device_type']} | 地址: {info['ip']}:{info['port']}")
+                if info.get('hostname') and info['hostname'] != dev_name:
+                    st.caption(f"主机名: {info['hostname']}")
+                if info.get('version'):
+                    st.caption(f"版本: {info['version']}")
                 col1, col2 = st.columns(2)
                 with col1:
                     if st.button("🔗 连接", key=f"conn_{dev_name}"): 
@@ -210,6 +369,26 @@ with st.sidebar:
                     if st.button("🗑️ 移除", key=f"del_{dev_name}"):
                         device_manager.remove_device(dev_name)
                         db_manager.delete_device(dev_name)
+                        st.rerun()
+
+                if st.button("🔄 读取此设备信息", key=f"refresh_{dev_name}"):
+                    with st.spinner(f"正在读取 {dev_name} 的信息..."):
+                        new_name = device_manager.refresh_device_name(dev_name)
+                    if new_name is None:
+                        st.warning("读取失败，请确认设备已连接。")
+                    else:
+                        info = device_manager.devices[new_name]
+                        db_manager.delete_device(dev_name)
+                        db_manager.add_device(
+                            new_name, info['ip'], info['port'], info['device_type'],
+                            hostname=info.get('hostname', ''),
+                            model=info.get('model', ''),
+                            version=info.get('version', ''),
+                        )
+                        if new_name != dev_name:
+                            st.success(f"已重命名为 {new_name}")
+                        else:
+                            st.success("信息已刷新")
                         st.rerun()
 
 # 主标签页 
@@ -234,8 +413,75 @@ with tab1:
     
     if st.session_state['last_parsed_tasks']: 
         st.subheader("🤖 当前解析结果") 
-        st.json(st.session_state['last_parsed_tasks']) 
-        
+        _tasks = st.session_state['last_parsed_tasks']
+
+        view_mode = st.radio(
+            "展示方式",
+            options=["📋 结构化 + 命令预览", "🧾 仅 JSON"],
+            horizontal=True,
+            key="parse_view_mode",
+        )
+
+        if view_mode == "🧾 仅 JSON":
+            st.json(_tasks)
+        else:
+            for idx, _task in enumerate(_tasks, 1):
+                _dev = _task.get("device") or _task.get("target_device") or "未指定设备"
+                _action = _task.get("action", "unknown")
+                _resolved = device_manager.resolve_device_name(_dev)
+                _badge = f"（已匹配设备：{_resolved}）" if _resolved else "（⚠️ 未找到该设备）"
+
+                with st.expander(f"任务 {idx}｜{_dev}｜{_action}", expanded=True):
+                    c1, c2 = st.columns([2, 3])
+                    with c1:
+                        st.markdown("**🖥️ 目标设备**")
+                        st.markdown(f"`{_dev}` {_badge}")
+                        st.markdown("**🧾 结构化 JSON**")
+                        st.json(_task)
+                    with c2:
+                        st.markdown("**⌨️ 对应华为 VRP 配置命令**")
+                        _cmds = command_gen.generate_with_comments(_task)
+                        if not _cmds:
+                            st.info("未能生成命令（该操作类型可能需要人工确认或补充参数）。")
+                        else:
+                            _lines = []
+                            for _i, _item in enumerate(_cmds, 1):
+                                _cmd = _item.get("command", "")
+                                _cmt = _item.get("comment", "")
+                                _lines.append(f"{_i:>2}. {_cmd}"
+                                              + (f"    # {_cmt}" if _cmt else ""))
+                            st.code("\n".join(_lines), language="text")
+                            with st.expander(f"📖 命令逐条注释（共 {len(_cmds)} 条）", expanded=False):
+                                for _i, _item in enumerate(_cmds, 1):
+                                    _cmt = _item.get("comment", "")
+                                    st.markdown(
+                                        f"`{_i}` **{_item.get('command', '')}**"
+                                        + (f" — {_cmt}" if _cmt else "")
+                                    )
+
+        with st.expander("🧩 全部任务的命令汇总", expanded=False):
+            _all_lines = []
+            for idx, _task in enumerate(_tasks, 1):
+                _dev = _task.get("device") or _task.get("target_device") or "未指定设备"
+                _all_lines.append(f"===== 任务 {idx}：{_dev} "
+                                  f"（{_task.get('action')}）=====")
+                _cmds = command_gen.generate_with_comments(_task)
+                if not _cmds:
+                    _all_lines.append("  (无可用命令)")
+                for _item in _cmds:
+                    _cmt = _item.get("comment", "")
+                    _all_lines.append(f"  {_item.get('command', '')}"
+                                      + (f"    # {_cmt}" if _cmt else ""))
+                _all_lines.append("")
+            st.code("\n".join(_all_lines).rstrip(), language="text")
+            st.download_button(
+                "⬇️ 下载命令脚本（.txt）",
+                data="\n".join(_all_lines).rstrip(),
+                file_name="ensp_commands.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
+
         if st.button("💾 保存至待执行清单", type="primary"):
             from datetime import datetime
             task_entry = {
@@ -256,30 +502,154 @@ with tab2:
         st.info("暂无设备，请先在侧边栏添加并连接设备")
     else:
         target_devs = st.multiselect("选择参与拓扑发现的设备", options=all_devs, default=all_devs, key="topo_devices")
-        if st.button("🚀 开始拓扑发现", type="primary"):
+
+        col_topo1, col_topo2 = st.columns([3, 1])
+        with col_topo1:
+            start_topo = st.button("🚀 开始拓扑发现", type="primary", use_container_width=True)
+        with col_topo2:
+            clear_topo = st.button("🧹 清空当前拓扑", use_container_width=True,
+                                   help="清除内存与文件中的拓扑数据，避免与上一次实验的旧拓扑混淆")
+
+        # 选项：是否强制重新发现（忽略历史加载的旧拓扑）
+        force_refresh = st.checkbox(
+            "强制重新发现（忽略历史旧拓扑）",
+            value=True,
+            help="勾选后，本次发现只反映实时采集结果；未采集到的旧设备不会残留。",
+            key="topo_force_refresh",
+        )
+        wait_converge = st.checkbox(
+            "等待 LLDP 收敛后再采集（推荐）",
+            value=True,
+            help="设备刚启动时邻居表可能未填充完整，开启后会自动等待若干秒，避免首次发现不完整。",
+            key="topo_wait_converge",
+        )
+
+        # 清空拓扑
+        if clear_topo:
+            topo_builder.clear()
+            try:
+                _topo_file = os.path.join("data", "topology.json")
+                if os.path.exists(_topo_file):
+                    os.remove(_topo_file)
+            except Exception as e:
+                st.warning(f"删除拓扑文件失败：{e}")
+            st.session_state.pop("topo_last_result", None)
+            st.success("已清空当前拓扑数据，请重新执行拓扑发现。")
+            st.rerun()
+
+        if start_topo:
             if not target_devs:
                 st.warning("请至少选择一个设备")
             else:
+                # 强制刷新时，先清空旧图，确保失败也不会残留上一份实验的拓扑
+                if force_refresh:
+                    topo_builder.clear()
+
+                # 步骤0：先检查连接，未连接的设备直接给出明确提示
+                not_connected = [d for d in target_devs if d not in device_manager.get_all_connected()]
+                if not_connected:
+                    st.warning(
+                        f"以下设备尚未连接，将尝试自动连接：{', '.join(not_connected)}"
+                    )
+
                 # 步骤1：确保参与拓扑发现的设备已启用 LLDP
+                lldp_failed = []
                 with st.spinner("正在检查并启用设备 LLDP 功能..."):
                     for dev in target_devs:
                         ok = device_manager.ensure_lldp_enabled(dev)
                         if not ok:
-                            st.warning(f"设备 {dev} 的 LLDP 启用可能失败，请稍后在 CLI 中手动确认。")
+                            lldp_failed.append(dev)
+                if lldp_failed:
+                    st.warning(
+                        f"以下设备的 LLDP 启用失败，其链路可能无法识别：{', '.join(lldp_failed)}。"
+                        "请确认设备已启动、端口映射正确，或在 CLI 中手动执行 'system-view' + 'lldp enable'。"
+                    )
+
+                # 步骤1.5：等待 LLDP 邻居表收敛，避免首次采集不完整
+                lldp_rows = {}
+                if wait_converge:
+                    with st.spinner("正在等待 LLDP 邻居信息收敛..."):
+                        lldp_rows = topo_collector.wait_lldp_convergence(target_devs)
+                    total_rows = sum(lldp_rows.values())
+                    if total_rows == 0:
+                        st.warning(
+                            "LLDP 邻居表仍为空。可能原因：设备刚启动尚未收敛、未启用 LLDP，"
+                            "或拓扑中确实没有 LLDP 链路。"
+                        )
 
                 # 步骤2：采集信息并构建拓扑
                 with st.spinner("正在采集设备信息并构建拓扑..."):
                     collected = topo_collector.collect_all(target_devs)
-                    graph = topo_builder.build(collected)
-                    topo_builder.save_topology()
-                st.success("拓扑发现完成")
+                    # 若采集结果为空或全部失败，给出明确反馈
+                    usable = {d: o for d, o in collected.items() if o and any(v for v in o.values())}
+                    if not usable:
+                        # 强制刷新已清空旧图，此处不会再展示上一份实验的拓扑
+                        st.error(
+                            "未能从任何设备采集到有效信息，无法构建拓扑。"
+                            "请检查设备连接状态与端口映射后重试。"
+                        )
+                        st.session_state["topo_last_result"] = {
+                            "ok": False, "nodes": 0, "edges": 0,
+                            "devices": [], "times": len(st.session_state.get("topo_discover_count", [])) + 1,
+                        }
+                    else:
+                        graph = topo_builder.build(usable)
+                        topo_builder.save_topology()
+                        n_nodes = graph.number_of_nodes()
+                        n_edges = graph.number_of_edges()
 
-        # 如果已有拓扑数据，进行可视化展示
-        if topo_builder.graph and topo_builder.graph.number_of_nodes() > 0:
+                        # 记录本次发现结果，用于展示与陈旧性判断
+                        st.session_state["topo_last_result"] = {
+                            "ok": True,
+                            "nodes": n_nodes,
+                            "edges": n_edges,
+                            "devices": sorted(graph.nodes()),
+                            "lldp_rows": lldp_rows,
+                        }
+                        st.session_state["topo_discover_count"] = (
+                            st.session_state.get("topo_discover_count", []) + [time.time()]
+                        )
+
+                        st.success(f"拓扑发现完成：识别到 {n_nodes} 台设备、{n_edges} 条链路。")
+
+                        # 提示本次结果是否与期望的设备集合一致
+                        missing = [d for d in target_devs if d not in graph]
+                        if missing:
+                            st.info(
+                                f"以下已选设备本次未出现在拓扑中：{', '.join(missing)}。"
+                                "若它们是刚启动的设备，可勾选「等待 LLDP 收敛」后重新发现。"
+                            )
+                        if n_edges == 0:
+                            st.info(
+                                "未识别到任何链路。请确认各设备已启用 LLDP 且已执行过数据采集；"
+                                "也可稍等 LLDP 邻居信息收敛后再次点击发现。"
+                            )
+
+        # 拓扑展示区：区分「本次发现结果」与「历史加载的拓扑」
+        last_result = st.session_state.get("topo_last_result")
+        has_graph = bool(topo_builder.graph and topo_builder.graph.number_of_nodes() > 0)
+
+        if has_graph:
             st.subheader("📍 当前拓扑视图")
+
+            # 若当前图来自历史文件加载（本次会话尚未成功发现过），明确提示
+            if not last_result or not last_result.get("ok"):
+                st.warning(
+                    "⚠️ 当前展示的是**历史保存的拓扑**（可能是上一次实验的残留），"
+                    "并非本次实时采集结果。请点击「🚀 开始拓扑发现」重新发现，"
+                    "或点击「🧹 清空当前拓扑」后重试。"
+                )
+            else:
+                st.caption(
+                    f"本次发现：{last_result['nodes']} 台设备、{last_result['edges']} 条链路"
+                    f"（已选 {len(target_devs)} 台）"
+                )
+
             fig = visualize_topology(topo_builder.graph)
             if fig:
                 st.pyplot(fig)
+        else:
+            st.info("当前没有拓扑数据。请点击「🚀 开始拓扑发现」构建拓扑。")
 
 with tab3: 
     st.header("⚙️ 任务执行与手动配置") 
@@ -300,6 +670,17 @@ with tab3:
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("🚀 立即执行该任务", type="primary", use_container_width=True):
+                    # 执行前先解析设备名，提前暴露"任务设备名与已配置设备不匹配"的问题
+                    unresolved = []
+                    for _t in selected_task_data['tasks']:
+                        _d = _t.get("device") or _t.get("target_device")
+                        if not _d or device_manager.resolve_device_name(_d) is None:
+                            unresolved.append(_d or "(未指定)")
+                    if unresolved:
+                        st.warning(
+                            f"以下目标设备未在设备列表中找到，相关任务将无法执行：{', '.join(unresolved)}。"
+                            "请在侧边栏确认设备名称，或使用“扫描添加设备”补充设备。"
+                        )
                     with st.spinner("正在下发配置..."):
                         results = executor.execute_tasks(selected_task_data['tasks'])
                         st.session_state['last_exec_results'] = results
@@ -312,7 +693,32 @@ with tab3:
     if 'last_exec_results' in st.session_state:
         st.divider()
         st.subheader("📊 执行结果反馈")
-        st.json(st.session_state['last_exec_results'])
+        _res = st.session_state['last_exec_results']
+
+        # 未匹配到设备的任务单独提示
+        if "__unresolved__" in _res:
+            st.error(_res["__unresolved__"].get("error", "存在未能匹配设备的任务"))
+            for item in _res["__unresolved__"].get("tasks", []):
+                st.markdown(f"- `{item.get('error', '')}` → 任务：{item.get('task')}")
+
+        for dev_key, dev_res in _res.items():
+            if dev_key == "__unresolved__":
+                continue
+            ok = dev_res.get("success")
+            with st.expander(f"{'✅' if ok else '❌'} {dev_key}", expanded=not ok):
+                if not dev_res.get("tasks"):
+                    st.info("该设备没有任何可执行任务。")
+                    continue
+                for item in dev_res["tasks"]:
+                    task = item.get("task", {})
+                    desc = task.get("description") or task.get("intent") or str(task)
+                    st.markdown(f"**任务**：{desc} {'✅' if item.get('success') else '❌'}")
+                    if item.get("commands"):
+                        st.code("\n".join(item["commands"]), language="text")
+                    if item.get("error"):
+                        st.warning(item["error"])
+        with st.expander("🧾 原始执行结果 (JSON)"):
+            st.json(_res)
         if st.button("🧹 清除执行记录"):
             del st.session_state['last_exec_results']
             st.rerun()
@@ -389,12 +795,30 @@ with tab3:
         col_cfg1, col_cfg2 = st.columns(2)
         with col_cfg1:
             if st.button("📑 读取当前配置", use_container_width=True):
-                with st.spinner(f"正在从 {cfg_dev} 读取当前配置..."):
-                    cfg_output = device_manager.execute_command(cfg_dev, "display current-configuration")
-                    if cfg_output is None:
-                        st.error("读取配置失败，请检查连接状态。")
+                resolved_dev = device_manager.resolve_device_name(cfg_dev) or cfg_dev
+                # 未连接则先尝试连接，避免直接读取失败
+                if resolved_dev not in device_manager.get_all_connected():
+                    with st.spinner(f"正在连接 {resolved_dev} ..."):
+                        connected = device_manager.connect(resolved_dev)
+                    if not connected:
+                        st.error(
+                            f"无法连接到设备 {resolved_dev}。请检查设备是否已启动、"
+                            "端口映射是否正确（可在侧边栏“扫描添加设备”重新发现）。"
+                        )
+                        st.stop()
+                with st.spinner(f"正在从 {resolved_dev} 读取当前配置（大配置需分页读取，请稍候）..."):
+                    # display current-configuration 输出可能上千行，走 execute_command
+                    # 内部会自动处理 ---- More ---- 分页与配置模式恢复
+                    cfg_output = device_manager.execute_command(resolved_dev, "display current-configuration")
+                    if not cfg_output:
+                        st.error(
+                            f"读取配置失败：未从 {resolved_dev} 获取到任何回显。"
+                            "可能原因：会话停留在分页/配置模式，或设备未就绪。"
+                            "可先点击侧边栏该设备的“🔄 刷新”重建会话后重试。"
+                        )
                     else:
-                        st.session_state["last_config_dump"] = {"device": cfg_dev, "content": cfg_output}
+                        st.session_state["last_config_dump"] = {"device": resolved_dev, "content": cfg_output}
+                        st.success(f"已读取 {resolved_dev} 配置，共 {len(cfg_output)} 字符。")
         with col_cfg2:
             if st.button("💾 保存配置到服务器", use_container_width=True):
                 cfg_info = st.session_state.get("last_config_dump")
@@ -468,4 +892,4 @@ with tab4:
 
 # 底部页脚
 st.markdown("---") 
-st.caption("eNSP AI Assistant v0.1.0 | Powered by Gemini & LangChain | © 2026")
+st.caption("NetPilot eNSP AI 网络助手 v0.1.0 | Powered by DeepSeek & LangChain | © 2026")
