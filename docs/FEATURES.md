@@ -6,6 +6,13 @@
 
 ### 一、自然语言与 AI
 
+- **无 .env 的优雅降级** ★
+  未配置 `.env` / API Key 时应用仍可正常启动运行，仅 AI 功能不可用：
+  - `LLMClient` 进入降级模式（不抛异常），`is_available()` 返回 `False`；
+  - 调用 AI 时抛出 `LLMUnavailableError`，页面给出醒目的 `.env` 配置引导；
+  - 页面顶部提示 **仍可用的非 AI 功能**（设备扫描/连接、手动下发、拓扑发现、配置读取等）；
+  - `local`（Ollama）provider 无需 Key。
+
 - **自然语言 → 配置任务**
   输入一句话描述需求（例如"在 R1 和 R2 之间配置 OSPF，并在 R1 上创建 VLAN 10"），AI 自动解析为结构化任务清单，
   每项包含 `device`（目标设备）、`action`（动作类型）、`parameters`（关键参数）。
@@ -137,4 +144,5 @@
   - `tests/test_device_manager.py`（12 项）：连接、会话恢复、配置下发；
   - `tests/test_topology.py`（10 项）：拓扑构建与幂等性；
   - `tests/test_topology_refresh.py`（28 项）：拓扑清空/重建不残留、LLDP 收敛等待；
+  - `tests/test_no_env.py`（18 项）：无 .env 降级运行与友好提示；
   - `tests/test_deepseek_mock.py`（14 项）：LLM 调用链路 mock 验证。

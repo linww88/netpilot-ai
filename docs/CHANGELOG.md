@@ -4,8 +4,8 @@
 
 - 修订性质：功能新增 + 缺陷修复 + 文档更新
 - 涉及代码文件：10 个
-- 新增测试文件：5 个（共 114 项离线测试）
-- 代码规模：`src/` 约 2,700 行，`tests/` 约 1,300 行
+- 新增测试文件：6 个（共 132 项离线测试）
+- 代码规模：`src/` 约 2,800 行，`tests/` 约 1,500 行
 
 ---
 
@@ -21,9 +21,10 @@
 8. [新增：命令注释预览](#8-新增命令注释预览)
 9. [修复：拓扑自动发现残留上一次实验的拓扑](#9-修复拓扑自动发现残留上一次实验的拓扑)
 10. [修复：全新克隆后无法启动（data 目录缺失）](#10-修复全新克隆后无法启动data-目录缺失)
-11. [文档更新](#11-文档更新)
-12. [测试与验证汇总](#12-测试与验证汇总)
-13. [改动文件清单](#13-改动文件清单)
+11. [新增：未配置 .env 时的优雅降级运行](#11-新增未配置-env-时的优雅降级运行)
+12. [文档更新](#12-文档更新)
+13. [测试与验证汇总](#13-测试与验证汇总)
+14. [改动文件清单](#14-改动文件清单)
 ---
 
 ## 1. 大模型默认配置迁移至 DeepSeek
@@ -514,7 +515,72 @@ FileNotFoundError: [Errno 2] No such file or directory: '.../data/app.log'
 
 ---
 
-## 11. 文档更新
+## 11. 新增：未配置 .env 时的优雅降级运行
+
+### 需求
+
+即使没有配置 `.env` 文件，项目也要能正常运行；此时仅 AI 识别与分析不可用，
+并给出配置 `.env` 的提示引导。
+
+### 问题现象（改动前）
+
+未配置 `.env`（或环境变量中没有 API Key）时，应用**启动即崩溃**：
+
+```
+OpenAIError: Missing credentials. Please pass an `api_key`, ...
+```
+
+原因：`LLMClient.__init__` 无条件构造 `ChatOpenAI(api_key="")`，缺少 Key 时直接抛异常，
+而 `init_components()` 在应用最早期调用它，导致整个 Streamlit 应用无法进入界面——
+连设备扫描、手动下发命令等与 AI 无关的功能也一并不可用。
+
+### 解决方案
+
+**`src/ai/llm_client.py` —— 引入"降级模式"**
+
+- 新增 `LLMUnavailableError` 异常（携带面向用户的中文引导文案 `ENV_HINT`）；
+- `__init__` 不再无条件构造底层客户端：先判断 provider 是否需要 Key、Key 是否为空；
+  - 缺 Key / 未知 provider / 初始化异常 → 进入降级模式（`available=False`），**不抛异常**；
+  - `local`（Ollama）provider 不需要 Key，始终可用；
+- 新增 `is_available()`、`describe_status()`，供 UI 判断与展示状态；
+- `invoke()` 在降级模式下抛出 `LLMUnavailableError`（而非返回空值，避免误判为"模型无输出"）。
+
+**各 AI 模块 —— 区分"不可用"与"无结果"**
+
+- `intent_parser.parse()`：移除会吞异常的外层 `try/except`，改为让 `LLMUnavailableError` 向上传播；
+- `fault_diagnosis.diagnose()`：捕获到 `LLMUnavailableError` 时向上抛出，其余异常仍返回结构化错误；
+- `command_gen._generate_with_llm()`：同样对 `LLMUnavailableError` 放行；
+- 三个模块均新增 `is_available()` 便捷方法。
+
+**`src/main.py` —— 界面提示与容错**
+
+- 应用标题下方新增醒目 `st.warning`：说明 AI 不可用、列出**仍可用的非 AI 功能**、给出三步配置引导，
+  并显示当前 provider / model / 环境变量名；
+- 侧边栏「🤖 AI & 搜索配置」底部新增即时状态提示（✅ 已就绪 / ⚠️ 缺少环境变量）；
+- 「🚀 开始解析」与「🩺 开始 AI 诊断」按钮：AI 不可用时直接给出友好提示（并建议改用手动下发），
+  调用过程捕获 `LLMUnavailableError` 显示具体原因。
+
+**`.env.example` / `README.md` / `docs/USER_GUIDE.md`**
+
+- 明确标注 `.env` 为**可选**，说明不配置时的能力边界与启用方法；
+- 常见问题表新增"未配置 `.env` 能否使用""提示 AI 功能当前不可用"两条。
+
+### 验证
+
+- 新增 `tests/test_no_env.py` **18/18 通过**，覆盖：
+  - 无 Key 时 `LLMClient` 初始化不崩溃、`available=False`；
+  - 三个 AI 组件可正常创建；
+  - **不依赖 AI 的内置命令模板仍可用**（VLAN / show 命令）；
+  - 调用 AI 抛出携带 `.env` 引导的 `LLMUnavailableError`；
+  - `ENV_HINT` 文案包含关键引导信息；
+  - 有 Key 时 `available=True`；`local` provider 无需 Key。
+- **实测**：在**完全没有 `.env`、清空 API Key 环境变量**的干净目录中启动 Streamlit，
+  返回 **HTTP 200**，日志无异常 —— 应用可正常运行。
+- 全量离线测试 **132/132 通过**（原 114 + 新增 18）。
+
+---
+
+## 12. 文档更新
 
 | 文件 | 更新内容 |
 | --- | --- |
@@ -528,7 +594,7 @@ FileNotFoundError: [Errno 2] No such file or directory: '.../data/app.log'
 
 ---
 
-## 12. 测试与验证汇总
+## 13. 测试与验证汇总
 
 ### 离线测试套件（不依赖真实设备与网络）
 
@@ -540,7 +606,8 @@ FileNotFoundError: [Errno 2] No such file or directory: '.../data/app.log'
 | `tests/test_device_manager.py` | 12 | 配置下发兜底、查询兜底、LLDP 三态、退出配置模式、会话恢复 |
 | `tests/test_topology.py` | 10 | hostname 归一化、无伪节点、链路正确、幂等、表头过滤 |
 | `tests/test_topology_refresh.py` | 28 | 拓扑清空与重建不残留、部分采集移除旧设备、采集失败清空图、历史加载后重建无残留、LLDP 收敛等待、行数统计 |
-| **合计** | **114** | **全部通过** |
+| `tests/test_no_env.py` | 18 | 无 .env 降级运行：初始化不崩溃、组件可创建、内置模板可用、AI 调用抛友好异常、ENV_HINT 内容、有 Key 可用、local 免 Key |
+| **合计** | **132** | **全部通过** |
 
 ### 真实环境验证
 
@@ -553,19 +620,21 @@ FileNotFoundError: [Errno 2] No such file or directory: '.../data/app.log'
 | 端到端配置下发 | VLAN 与接口 IP 均确认生效 |
 | Streamlit 应用启动 | HTTP 200，日志 0 错误 |
 | 拓扑刷新（新实验覆盖旧实验） | 28/28 离线测试通过，重建不残留历史节点与链路 |
+| 无 .env 降级运行 | 18/18 离线测试通过；无 .env 启动 Streamlit HTTP 200，AI 功能提示引导配置 |
 
 ---
 
-## 13. 改动文件清单
+## 14. 改动文件清单
 
 ### 代码文件（10 个）
 
 | 文件 | 主要改动 |
 | --- | --- |
 | `config/config.yaml` | DeepSeek 默认配置、扫描参数、Provider 预设 |
-| `src/ai/llm_client.py` | 多 Provider 架构、参数解析重写 |
-| `src/ai/intent_parser.py` | JSON 提取容错（四种形态） |
-| `src/ai/command_gen.py` | 修复 `{task}` KeyError、补齐 3 个模板、命令注释预览 |
+| `src/ai/llm_client.py` | 多 Provider 架构、参数解析重写、**无 Key 降级模式与 `LLMUnavailableError`** |
+| `src/ai/intent_parser.py` | JSON 提取容错（四种形态）、**AI 不可用时异常上抛** |
+| `src/ai/fault_diagnosis.py` | **AI 不可用时异常上抛**，其余异常结构化返回 |
+| `src/ai/command_gen.py` | 修复 `{task}` KeyError、补齐 3 个模板、命令注释预览、**AI 异常放行** |
 | `src/connection/device_manager.py` | 端口扫描、设备识别、自动命名、名称解析、会话恢复、回显清理、配置读取 |
 | `src/executor/config_executor.py` | 设备名解析、未匹配任务记录 |
 | `src/topology/builder.py` | 图重置（新增 `clear()`）、hostname 归一化、链路去重、UTF-8 |
@@ -590,6 +659,7 @@ FileNotFoundError: [Errno 2] No such file or directory: '.../data/app.log'
 | `tests/test_deepseek_mock.py` | 新增 |
 | `tests/test_topology.py` | 新增 |
 | `tests/test_topology_refresh.py` | 新增 |
+| `tests/test_no_env.py` | 新增 |
 | `tests/test_device_manager.py` | 现有文件，断言同步当前实现 |
 | `tests/test_deepseek.py` | 真实接口测试脚本 |
 

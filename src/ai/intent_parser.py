@@ -3,7 +3,7 @@ import json
 import logging 
 import re
 from typing import List, Dict, Any 
-from .llm_client import LLMClient 
+from .llm_client import LLMClient, LLMUnavailableError 
 from ..utils.prompt_loader import load_prompt
 
 logger = logging.getLogger(__name__) 
@@ -14,27 +14,32 @@ class IntentParser:
     def __init__(self, llm_client: LLMClient, topology_context: str = ""): 
         self.llm = llm_client 
         self.topology_context = topology_context 
-        
+
+    def is_available(self) -> bool:
+        """AI 解析能力是否可用（未配置 .env 时为 False）"""
+        return bool(self.llm and self.llm.is_available())
+
     def parse(self, user_input: str) -> List[Dict[str, Any]]: 
-        """解析指令，返回任务列表""" 
-        try:
-            prompt_template = load_prompt("intent_parser.txt") 
-            prompt = prompt_template.format( 
-                topology_context=self.topology_context or "（暂无拓扑信息，请仅根据用户指令中的设备名解析）", 
-                user_input=user_input 
-            ) 
-            
-            response = self.llm.invoke(prompt) 
-            logger.info(f"Raw LLM response: {response!r}")
-            # 提取 JSON 
-            tasks = self._extract_json(response) 
-            if not tasks:
-                logger.warning(f"Intent parsing produced no tasks. Raw response: {response!r}")
-            logger.info(f"Parsed tasks: {tasks}") 
-            return tasks 
-        except Exception as e: 
-            logger.error(f"Intent parsing failed: {e}") 
-            return [] 
+        """解析指令，返回任务列表
+
+        注意：当 LLM 未配置（缺少 .env / API Key）时，**不吞掉异常**，
+        而是抛出 LLMUnavailableError，交由 UI 层提示用户配置，
+        避免让用户误以为"模型返回了空结果"。
+        """ 
+        prompt_template = load_prompt("intent_parser.txt") 
+        prompt = prompt_template.format( 
+            topology_context=self.topology_context or "（暂无拓扑信息，请仅根据用户指令中的设备名解析）", 
+            user_input=user_input 
+        ) 
+
+        response = self.llm.invoke(prompt) 
+        logger.info(f"Raw LLM response: {response!r}")
+        # 提取 JSON 
+        tasks = self._extract_json(response) 
+        if not tasks:
+            logger.warning(f"Intent parsing produced no tasks. Raw response: {response!r}")
+        logger.info(f"Parsed tasks: {tasks}") 
+        return tasks 
     
     def _extract_json(self, text: str) -> List[Dict]: 
         """从 LLM 回复中提取 JSON 数组

@@ -101,6 +101,11 @@ cp .env.example .env
 # 编辑 .env，设置：DEEPSEEK_API_KEY=sk-xxxxxxxx
 ```
 
+> **`.env` 是可选的（非必需）**：不配置 `.env` 项目同样能正常启动运行，
+> 只是 **AI 相关功能（自然语言指令解析、故障诊断、LLM 生成命令）不可用**；
+> 此时设备扫描/连接、手动命令下发、批量命令执行、配置读取、拓扑自动发现等功能仍可正常使用。
+> 页面顶部会给出醒目的配置引导。配置好 `.env` 后重启应用即可启用 AI。
+
 默认参数（可在 `config/config.yaml` 的 `llm` 段调整，或在 Web 侧边栏临时切换）：
 
 | 配置项           | 默认值                        |
@@ -111,6 +116,7 @@ cp .env.example .env
 | `api_key_env` | `DEEPSEEK_API_KEY`         |
 
 支持的 provider：`deepseek`（默认）、`openai`、`openai_compatible`（需填 `base_url`）、`local`（本地 Ollama）。
+其中 `local`（Ollama）不需要 API Key。
 
 ### 4. 启动应用
 
@@ -192,6 +198,7 @@ python tests/test_device_manager.py     # 连接/会话/配置下发（12 项）
 python tests/test_topology.py           # 拓扑构建（10 项）
 python tests/test_deepseek_mock.py      # LLM 链路 mock（14 项）
 python tests/test_topology_refresh.py   # 拓扑刷新与 LLDP 收敛（28 项）
+python tests/test_no_env.py             # 无 .env 降级运行（18 项）
 ```
 
 如需验证真实 DeepSeek 连通性（会消耗额度）：
@@ -212,6 +219,8 @@ python tests/test_deepseek.py
 | 拓扑无链路         | 确认设备已启用 LLDP，稍等邻居收敛后再次发现                                      |
 | 启动报错 `File not found: data/app.log` | 旧版本的问题；新版会自动创建 `data/` 目录。若仍报错，请确认工作目录为项目根目录（`cd` 到含 `src/` 的目录再运行） |
 | 下载后 `data/` 目录不存在 | 属正常现象：`data/` 是运行期数据，不入库；首次运行会自动生成 |
+| 未配置 `.env` 能否使用 | 可以。应用正常启动，仅 AI 功能（指令解析/故障诊断）不可用，其余功能正常；页面顶部会提示如何配置 |
+| 提示"AI 功能当前不可用" | 未检测到大模型 API Key；按提示复制 `.env.example` 为 `.env` 并填写 `DEEPSEEK_API_KEY`，重启应用即可 |
 
 ## License
 

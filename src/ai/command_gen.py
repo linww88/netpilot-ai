@@ -2,7 +2,7 @@
 import json 
 import logging 
 from typing import List, Dict, Any 
-from .llm_client import LLMClient 
+from .llm_client import LLMClient, LLMUnavailableError 
 from ..utils.prompt_loader import load_prompt 
 
 logger = logging.getLogger(__name__) 
@@ -21,6 +21,10 @@ class CommandGenerator:
             "config_acl": self._gen_acl,
             "show_command": self._gen_show,
         } 
+
+    def is_available(self) -> bool:
+        """AI 生成能力是否可用（内置模板不依赖 AI，未配置 .env 时仍可用）"""
+        return bool(self.llm and self.llm.is_available())
     
     def generate(self, task: Dict[str, Any]) -> List[str]: 
         """为单个任务生成命令列表""" 
@@ -221,19 +225,26 @@ class CommandGenerator:
         return [str(cmd)] if cmd else []
     
     def _generate_with_llm(self, task: Dict) -> List[str]: 
-        """调用LLM生成未知类型的命令""" 
+        """调用LLM生成未知类型的命令
+
+        当 LLM 未配置时抛出 LLMUnavailableError（由 UI 提示配置 .env），
+        以便区分"模型不可用"与"模型返回为空"两种情况。
+        """ 
+        prompt_template = load_prompt("command_gen.txt") 
+        # 模板使用 {task} 占位符，这里传入完整的任务描述
+        task_desc = (
+            f"目标设备：{task.get('target_devices') or task.get('device') or '未指定'}；"
+            f"操作类型：{task.get('action')}；"
+            f"参数：{task.get('parameters', {})}"
+        )
+        prompt = prompt_template.format(task=task_desc)
         try:
-            prompt_template = load_prompt("command_gen.txt") 
-            # 模板使用 {task} 占位符，这里传入完整的任务描述
-            task_desc = (
-                f"目标设备：{task.get('target_devices') or task.get('device') or '未指定'}；"
-                f"操作类型：{task.get('action')}；"
-                f"参数：{task.get('parameters', {})}"
-            )
-            prompt = prompt_template.format(task=task_desc)
             response = self.llm.invoke(prompt) 
             # 尝试解析返回的命令列表 
             return self._parse_command_list(response) 
+        except LLMUnavailableError:
+            # 未配置 Key：向上抛出，交由 UI 给出配置引导
+            raise
         except Exception as e:
             logger.error(f"LLM command generation failed: {e}")
             return []

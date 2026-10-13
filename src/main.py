@@ -16,7 +16,7 @@ from src.connection.device_manager import DeviceManager
 from src.topology.collector import InfoCollector 
 from src.topology.builder import TopologyBuilder 
 from src.topology.visualizer import visualize_topology 
-from src.ai.llm_client import LLMClient 
+from src.ai.llm_client import LLMClient, LLMUnavailableError, ENV_HINT 
 from src.ai.intent_parser import IntentParser 
 from src.ai.command_gen import CommandGenerator 
 from src.ai.fault_diagnosis import FaultDiagnosis 
@@ -129,6 +129,14 @@ with st.sidebar:
         help="开启后，解析/诊断逻辑可按需接入在线搜索能力（当前为预留开关）。",
     )
 
+    # AI 配置状态提示（此处 llm_client 尚未创建，用环境变量做即时判断）
+    _peek_key_env = st.session_state.get('llm_api_key_env', 'DEEPSEEK_API_KEY')
+    _peek_provider = st.session_state.get('llm_provider', 'deepseek')
+    if _peek_provider != 'local' and not (os.getenv(_peek_key_env, "") or "").strip():
+        st.caption(f"⚠️ 未检测到环境变量 `{_peek_key_env}`，AI 功能将不可用（配置 .env 后重启）")
+    else:
+        st.caption("✅ AI 配置已就绪")
+
 # 初始化核心组件（使用 st.cache_resource 确保在 Streamlit 重新运行时不会重复创建连接池等）
 @st.cache_resource
 def init_components(llm_overrides: dict):
@@ -166,6 +174,20 @@ device_manager, llm_client, intent_parser, command_gen, executor, tester, diagno
 # Streamlit 界面布局
 st.set_page_config(page_title="NetPilot eNSP AI 网络助手", layout="wide", page_icon="🧠") 
 st.title("🧠 NetPilot eNSP AI 网络助手") 
+
+# AI 可用性提示（缺 .env / API Key 时给出明确引导，但应用仍可继续使用）
+_ai_available = llm_client.is_available()
+if not _ai_available:
+    st.warning(
+        "⚠️ **AI 功能当前不可用**（未检测到有效的大模型 API Key）。\n\n"
+        "你仍然可以使用：**设备扫描/连接、手动命令下发、批量命令执行、设备配置读取、拓扑自动发现** 等功能。\n\n"
+        "如需启用自然语言解析与故障诊断，请：\n"
+        "1. 复制项目根目录的 `.env.example` 为 `.env`；\n"
+        "2. 在 `.env` 中填写 `DEEPSEEK_API_KEY=sk-你的密钥`；\n"
+        "3. 保存后重启应用。\n\n"
+        f"（当前 LLM 配置：provider=`{llm_client.provider}`，model=`{llm_client.model}`，"
+        f"环境变量=`{llm_client.api_key_env}`）"
+    )
 
 # 侧边栏：设备管理 
 _scan_cfg = config.get('connection', {})
@@ -404,10 +426,22 @@ with tab1:
         parse_btn = st.button("🚀 开始解析", use_container_width=True)
     
     if parse_btn: 
-        if user_input: 
-            with st.spinner("AI 正在解析意图..."): 
-                tasks = intent_parser.parse(user_input) 
-                st.session_state['last_parsed_tasks'] = tasks 
+        if not _ai_available:
+            st.error(
+                "AI 功能不可用，无法解析自然语言指令。请先配置 `.env`（见页面上方提示）。\n\n"
+                "在此期间，你仍可使用「⚙️ 手动配置下发」标签页直接下发命令。"
+            )
+        elif user_input: 
+            try:
+                with st.spinner("AI 正在解析意图..."): 
+                    tasks = intent_parser.parse(user_input) 
+                    st.session_state['last_parsed_tasks'] = tasks 
+                if not tasks:
+                    st.warning("AI 未解析出任何任务，请调整指令表述后重试。")
+            except LLMUnavailableError as e:
+                st.error(f"AI 调用失败：{e}")
+            except Exception as e:
+                st.error(f"解析过程出错：{e}")
         else:
             st.warning("请输入指令内容")
     
@@ -846,7 +880,11 @@ with tab4:
     fault_desc = st.text_area("⚠️ 故障现象描述 (例如: 'R1 无法 ping 通 R2，但是 R1 接口状态是 UP')", height=100) 
     
     if st.button("🩺 开始 AI 诊断", type="primary"): 
-        if fault_desc: 
+        if not _ai_available:
+            st.error(
+                "AI 功能不可用，无法进行故障诊断。请先配置 `.env`（见页面上方提示）。"
+            )
+        elif fault_desc: 
             all_devs = list(device_manager.devices.keys())
             if not all_devs:
                 st.warning("请先添加设备以供 AI 采集诊断数据")
@@ -868,10 +906,15 @@ with tab4:
                             "routing": cmd_res.get("display ip routing-table"),
                             "interfaces": cmd_res.get("display ip interface brief"),
                         }
-                    
-                    with st.spinner("AI 专家正在分析根因并生成修复方案..."): 
-                        diag_result = diagnosis.diagnose(fault_desc, device_outputs) 
-                        st.session_state['diag_result'] = diag_result 
+
+                    try:
+                        with st.spinner("AI 专家正在分析根因并生成修复方案..."): 
+                            diag_result = diagnosis.diagnose(fault_desc, device_outputs) 
+                            st.session_state['diag_result'] = diag_result 
+                    except LLMUnavailableError as e:
+                        st.error(f"AI 诊断失败：{e}")
+                    except Exception as e:
+                        st.error(f"诊断过程出错：{e}")
         else:
             st.warning("请先描述故障现象")
 
