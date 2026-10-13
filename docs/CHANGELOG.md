@@ -20,9 +20,10 @@
 7. [修复：指令解析与执行链路](#7-修复指令解析与执行链路)
 8. [新增：命令注释预览](#8-新增命令注释预览)
 9. [修复：拓扑自动发现残留上一次实验的拓扑](#9-修复拓扑自动发现残留上一次实验的拓扑)
-10. [文档更新](#10-文档更新)
-11. [测试与验证汇总](#11-测试与验证汇总)
-12. [改动文件清单](#12-改动文件清单)
+10. [修复：全新克隆后无法启动（data 目录缺失）](#10-修复全新克隆后无法启动data-目录缺失)
+11. [文档更新](#11-文档更新)
+12. [测试与验证汇总](#12-测试与验证汇总)
+13. [改动文件清单](#13-改动文件清单)
 ---
 
 ## 1. 大模型默认配置迁移至 DeepSeek
@@ -457,7 +458,63 @@ AI 解析出的设备名（如 `R1`）与用户实际配置的设备键（如 `O
 
 ---
 
-## 10. 文档更新
+## 10. 修复：全新克隆后无法启动（data 目录缺失）
+
+### 问题现象
+
+从 GitHub 克隆项目后直接运行，应用启动即报错崩溃：
+
+```
+FileNotFoundError: [Errno 2] No such file or directory: '.../data/app.log'
+```
+
+### 根因
+
+`data/` 目录存放运行期数据（SQLite 数据库、日志、配置备份、拓扑文件），
+已通过 `.gitignore` 排除，因此**仓库中不含 `data/` 目录**——这是正确的做法。
+但代码中存在两处**未先创建目录就直接写入**的缺陷：
+
+| 文件 | 缺陷代码 | 后果 |
+| --- | --- | --- |
+| `src/utils/logger.py` | `logging.FileHandler('./data/app.log')` | `main.py` 启动时立即调用 `setup_logger()`，目录不存在即抛 `FileNotFoundError`，**应用彻底无法启动** |
+| `src/validator/reporter.py` | `open(f"{self.data_dir}/{filename}", "w")` | 生成报告时目录不存在会报错 |
+
+其余模块（`db.py` / `builder.py` / `device_manager.py` / `main.py` 备份逻辑）
+均已正确使用 `os.makedirs(..., exist_ok=True)`，问题仅集中于上述两处。
+
+### 解决方案
+
+**`src/utils/logger.py`**
+
+- `setup_logger()` 中先 `os.makedirs("data", exist_ok=True)` 再创建 `FileHandler`；
+- 日志文件路径改用 `os.path.join`，并显式指定 `encoding='utf-8'`。
+
+**`src/validator/reporter.py`**
+
+- `ReportGenerator.__init__()` 中 `os.makedirs(self.data_dir, exist_ok=True)`；
+- 报告写入显式指定 `encoding="utf-8"` 与 `ensure_ascii=False`（避免中文乱码）。
+
+**`.gitignore`**
+
+- 规则由 `data/` 调整为 `data/*` + `!data/.gitkeep`，使仓库能保留一个占位文件
+  `data/.gitkeep` 以维持目录结构，同时继续忽略其中所有运行期产物。
+
+**`README.md`**
+
+- 「启动应用」小节补充说明：首次运行会自动创建 `data/`，无需手动建目录；
+- 常见问题表新增「启动报错 `File not found: data/app.log`」与「下载后 data/ 不存在」两条。
+
+### 验证
+
+- 在**不含 `data/` 目录**的干净目录中复现原报错 → 应用修复后 `setup_logger()` 与
+  `ReportGenerator` 均正常运行，并自动创建出 `data/`。
+- `git add` 验证：仅 `data/.gitkeep` 被跟踪，`app.log` / `ensp_ai.db` / `topology.json` /
+  `config_backups/` 仍被忽略。
+- 离线测试 114/114 通过。
+
+---
+
+## 11. 文档更新
 
 | 文件 | 更新内容 |
 | --- | --- |
@@ -471,7 +528,7 @@ AI 解析出的设备名（如 `R1`）与用户实际配置的设备键（如 `O
 
 ---
 
-## 11. 测试与验证汇总
+## 12. 测试与验证汇总
 
 ### 离线测试套件（不依赖真实设备与网络）
 
@@ -499,7 +556,7 @@ AI 解析出的设备名（如 `R1`）与用户实际配置的设备键（如 `O
 
 ---
 
-## 12. 改动文件清单
+## 13. 改动文件清单
 
 ### 代码文件（10 个）
 
