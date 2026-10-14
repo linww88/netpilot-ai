@@ -138,12 +138,17 @@
   - 所有操作与错误记录到日志文件，便于排错与审计。
 
 - **离线测试套件** ★
-  提供不依赖真实设备与网络的测试：
+  提供不依赖真实设备与网络的测试，分 pytest 与脚本两种风格：
+
+  *pytest 风格（`pytest tests/`，20 个用例）：*
+  - `tests/test_topology_refresh.py`：拓扑清空/重建不残留、LLDP 收敛等待；
+  - `tests/test_no_env.py`：无 .env 降级运行与友好提示；
+  - `tests/test_app_startup.py`：set_page_config 顺序约束、**禁止 expander 嵌套**（AST + AppTest）。
+
+  *脚本风格（`python tests/xxx.py`，100 项断言）：*
   - `tests/test_device_scan.py`（29 项）：端口扫描、身份识别、命名、数据库迁移等；
   - `tests/test_command_comments.py`（21 项）：命令生成与注释；
   - `tests/test_device_manager.py`（12 项）：连接、会话恢复、配置下发；
   - `tests/test_topology.py`（10 项）：拓扑构建与幂等性；
-  - `tests/test_topology_refresh.py`（28 项）：拓扑清空/重建不残留、LLDP 收敛等待；
-  - `tests/test_no_env.py`（18 项）：无 .env 降级运行与友好提示；
-  - `tests/test_app_startup.py`（8 项）：set_page_config 顺序约束（AST + AppTest）；
-  - `tests/test_deepseek_mock.py`（14 项）：LLM 调用链路 mock 验证。
+  - `tests/test_deepseek_mock.py`（14 项）：LLM 调用链路 mock 验证；
+  - `tests/test_deepseek.py`（14 项）：LLM 契约（含无 Key 降级）与命令解析。

@@ -99,6 +99,62 @@ def test_no_top_level_st_sidebar_before_config():
     # 否则由上一个用例覆盖
 
 
+def _container_kind_with_stmt(node):
+    """判断 with 语句是否为 Streamlit 容器上下文，返回 'expander'|'popover'|None
+
+    注意：`with st.expander("...") as box:` 的 context_expr 是 ast.Call
+    （st.expander(...)），不是 ast.Attribute。
+    """
+    if not isinstance(node, ast.With):
+        return None
+    for item in node.items:
+        ctx = item.context_expr
+        if isinstance(ctx, ast.Call):
+            f = ctx.func
+            if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) \
+                    and f.value.id == "st" and f.attr in ("expander", "popover"):
+                return f.attr
+    return None
+
+
+def test_no_nested_expander():
+    """静态检查：禁止 expander 嵌套 expander
+
+    复现并验证该报错场景：
+      "StreamlitAPIException: Expanders may not be nested inside other expanders."
+    Streamlit 明确禁止该嵌套；应改用 st.popover / st.container 等可嵌套容器。
+
+    实现：深度优先遍历 AST，维护「当前所处的 Streamlit 容器栈」。
+    遇到 with st.expander 时，若栈中已存在 expander，则判为违规。
+    """
+    src = open(MAIN_PY, encoding="utf-8").read()
+    tree = ast.parse(src)
+
+    violations = []
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self):
+            self.stack = []  # 元素：'expander' | 'popover' | None
+
+        def generic_visit(self, node):
+            kind = _container_kind_with_stmt(node)
+            if kind is not None:
+                if kind == "expander" and "expander" in self.stack:
+                    violations.append(node.lineno)
+                self.stack.append(kind)
+                for child in ast.iter_child_nodes(node):
+                    self.visit(child)
+                self.stack.pop()
+                return
+            super().generic_visit(node)
+
+    Visitor().visit(tree)
+
+    check("main.py 中不存在 expander 嵌套 expander",
+          len(violations) == 0,
+          f"违规行：{violations}" if violations else "无嵌套")
+
+
 def test_apptest_runs_without_exception():
     """运行时检查：AppTest 实际执行脚本，断言无异常"""
     try:
@@ -133,6 +189,7 @@ def main():
     for fn in (
         test_set_page_config_is_first_and_single,
         test_no_top_level_st_sidebar_before_config,
+        test_no_nested_expander,
         test_apptest_runs_without_exception,
     ):
         print(f"\n--- {fn.__name__} ---")

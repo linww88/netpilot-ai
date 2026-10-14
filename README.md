@@ -189,7 +189,19 @@ streamlit run src/main.py
 
 ## 运行测试
 
-项目内置离线测试套件，**不依赖真实设备与网络**：
+项目内置离线测试套件，**不依赖真实设备与网络**。测试分两套风格：
+
+**① pytest 风格**（用 `pytest` 收集，共 20 个用例）：
+
+```bash
+pytest tests/                            # 一次性运行全部 pytest 用例
+# 也可单独运行：
+pytest tests/test_app_startup.py         # Streamlit 启动约束 / set_page_config 顺序 / 禁止 expander 嵌套
+pytest tests/test_no_env.py              # 无 .env 降级运行
+pytest tests/test_topology_refresh.py    # 拓扑刷新与 LLDP 收敛
+```
+
+**② 脚本风格**（用 `python` 逐个运行，共 100 项断言）：
 
 ```bash
 python tests/test_device_scan.py        # 端口扫描与设备命名（29 项）
@@ -197,12 +209,13 @@ python tests/test_command_comments.py   # 命令注释生成（21 项）
 python tests/test_device_manager.py     # 连接/会话/配置下发（12 项）
 python tests/test_topology.py           # 拓扑构建（10 项）
 python tests/test_deepseek_mock.py      # LLM 链路 mock（14 项）
-python tests/test_topology_refresh.py   # 拓扑刷新与 LLDP 收敛（28 项）
-python tests/test_no_env.py             # 无 .env 降级运行（18 项）
-python tests/test_app_startup.py        # Streamlit 启动约束 / set_page_config 顺序（8 项）
+python tests/test_deepseek.py           # LLM 契约与命令解析（14 项，默认走 mock，不消耗额度）
 ```
 
-如需验证真实 DeepSeek 连通性（会消耗额度）：
+> 说明：`pytest tests/` 只会收集到 pytest 风格的 20 个用例，脚本风格的 6 个文件需用
+> `python tests/xxx.py` 单独运行——两种方式合计 **120 个测试单元**，全部通过。
+
+如需验证真实 DeepSeek 连通性（会消耗额度），请先配置 `.env`：
 
 ```bash
 python tests/test_deepseek.py

@@ -488,7 +488,11 @@ with tab1:
                                 _lines.append(f"{_i:>2}. {_cmd}"
                                               + (f"    # {_cmt}" if _cmt else ""))
                             st.code("\n".join(_lines), language="text")
-                            with st.expander(f"📖 命令逐条注释（共 {len(_cmds)} 条）", expanded=False):
+                            # 注意：Streamlit 禁止 expander 嵌套 expander。
+                            # 此处已位于「任务」expander 内部，故改用 popover
+                            # （popover 可以嵌套，交互上也更紧凑）。
+                            with st.popover(f"📖 命令逐条注释（共 {len(_cmds)} 条）",
+                                            use_container_width=True):
                                 for _i, _item in enumerate(_cmds, 1):
                                     _cmt = _item.get("comment", "")
                                     st.markdown(

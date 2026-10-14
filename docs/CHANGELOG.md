@@ -617,16 +617,69 @@ Streamlit 强制要求 `set_page_config()` 为脚本中**第一条** Streamlit �
 
 ### 验证
 
-- 新增 `tests/test_app_startup.py` **8/8 通过**：
+- 新增 `tests/test_app_startup.py`，覆盖：
   - **静态检查（AST）**：`set_page_config` 恰好出现一次、是最早的 `st.*` 调用、
     其之前无其他 `st.*` 命令、`with st.sidebar` 均在其之后；
   - **运行时检查（Streamlit AppTest）**：实际执行 `src/main.py`，断言无异常抛出并成功渲染标题。
 - 实测在**无 `.env`** 的干净目录启动，AppTest 运行**无异常**，页面标题正常渲染。
-- 全量离线测试 **140/140 通过**（原 132 + 新增 8）。
 
 ---
 
-## 13. 文档更新
+## 13. 修复：自然语言指令解析后 expander 嵌套报错
+
+### 现象
+
+使用「自然语言指令解析」后，解析结果区渲染时报错：
+
+```
+StreamlitAPIException: Expanders may not be nested inside other expanders.
+Traceback:
+File "src\main.py", line 491, in <module>
+with st.expander(f"📖 命令逐条注释（共 {len(_cmds)} 条）", expanded=False):
+```
+
+### 根因
+
+`src/main.py` 第 491 行的「命令逐条注释」`st.expander`，被放置在第 471 行的
+「任务 N｜设备｜动作」`st.expander` **内部**。Streamlit 明确禁止 `expander`
+嵌套 `expander`（`st.popover`、`st.container` 等容器则可嵌套），因此运行到该行
+必然抛 `StreamlitAPIException`。
+
+排查后确认：`main.py` 中 **仅此一处**存在该嵌套，其余 7 处 `st.expander`
+（第 201 / 375 / 499 / 745 / 757 / 814 行等）均位于顶层，不构成违规。
+
+### 修复
+
+将第 491 行的内层 `st.expander` 替换为 `st.popover`（Streamlit 1.32+ 支持，
+本项目依赖 1.65.0，已验证可用）：
+
+```python
+st.code("\n".join(_lines), language="text")
+# 注意：Streamlit 禁止 expander 嵌套 expander。
+# 此处已位于「任务」expander 内部，故改用 popover
+# （popover 可以嵌套，交互上也更紧凑）。
+with st.popover(f"📖 命令逐条注释（共 {len(_cmds)} 条）",
+                use_container_width=True):
+    ...
+```
+
+交互体验保持一致：仍是「点击展开查看逐条注释」，且 `use_container_width=True`
+使其宽度与上方命令代码块对齐。
+
+### 验证
+
+- 新增静态守卫 `test_no_nested_expander()`：基于 AST 深度优先遍历，维护
+  「当前所处的 Streamlit 容器栈」，遇到 `with st.expander` 时若栈中已有
+  `expander` 即判违规，并报出**具体行号**。
+- **阳性验证**（关键）：临时把 `st.popover` 改回内层 `st.expander` 注入嵌套，
+  守卫**正确报 FAIL 且定位到违规行 494**；还原后恢复 PASS——证明该守卫
+  不是空转。
+- AppTest 实际运行 `src/main.py`**无异常**，标题正常渲染。
+- 全量离线测试全部通过（pytest 20 项 + 脚本 100 项 = **120 个测试单元**）。
+
+---
+
+## 14. 文档更新
 
 | 文件 | 更新内容 |
 | --- | --- |
@@ -640,7 +693,7 @@ Streamlit 强制要求 `set_page_config()` 为脚本中**第一条** Streamlit �
 
 ---
 
-## 14. 测试与验证汇总
+## 15. 测试与验证汇总
 
 ### 离线测试套件（不依赖真实设备与网络）
 
@@ -672,7 +725,7 @@ Streamlit 强制要求 `set_page_config()` 为脚本中**第一条** Streamlit �
 
 ---
 
-## 15. 改动文件清单
+## 16. 改动文件清单
 
 ### 代码文件（10 个）
 
