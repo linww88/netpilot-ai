@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(project_root, ".env"))
 
-from src.ai.llm_client import LLMClient
+from src.ai.llm_client import LLMClient, LLMUnavailableError
 from src.ai.intent_parser import IntentParser
 from src.ai.command_gen import CommandGenerator
 from src.ai.fault_diagnosis import FaultDiagnosis
@@ -84,18 +84,29 @@ def main():
     check("故障诊断返回结构化结果", isinstance(res, dict) and bool(res.get("analysis")),
           f"risk_level={res.get('risk_level')}")
 
-    print("\n=== 7. 缺少 Key 时的报错行为 ===")
-    # 新版 langchain-openai 在「构造时」即校验凭证，缺少 Key 会立即抛错，
-    # 这属于期望行为（快速失败），而非缺陷。
+    print("\n=== 7. 缺少 Key 时的降级行为 ===")
+    # 设计约定：缺少 API Key 时不再快速失败，而是「优雅降级」——
+    # 构造成功、is_available() 返回 False，真正调用时才抛 LLMUnavailableError，
+    # 这样即使没有 .env，应用也能正常启动（仅禁用 AI 功能）。
     try:
         fallback_cfg = dict(llm_cfg)
         fallback_cfg["api_key_env"] = "NON_EXISTENT_KEY_ENV"
         fallback_cfg["api_key"] = ""
-        LLMClient(fallback_cfg)
-        check("缺少 Key 时立即报错（快速失败）", False, "未报错，可能静默使用了环境中的其他凭证")
-    except Exception as e:
-        check("缺少 Key 时立即报错（快速失败）", "credential" in str(e).lower() or "api_key" in str(e).lower(),
-              f"{type(e).__name__}: {str(e)[:70]}")
+        fallback_llm = LLMClient(fallback_cfg)
+        check("缺少 Key 时构造不抛异常（可正常启动）", True, "已降级为不可用状态")
+        check("缺少 Key 时 is_available() 为 False", fallback_llm.is_available() is False)
+        invoked_error = None
+        try:
+            fallback_llm.invoke("你好")
+        except LLMUnavailableError as e:
+            invoked_error = e
+        except Exception as e:  # noqa: BLE001
+            invoked_error = e
+        check("缺少 Key 时 invoke() 抛 LLMUnavailableError",
+              isinstance(invoked_error, LLMUnavailableError),
+              type(invoked_error).__name__ if invoked_error else "未抛异常")
+    except Exception as e:  # noqa: BLE001
+        check("缺少 Key 时构造不抛异常（可正常启动）", False, f"{type(e).__name__}: {str(e)[:70]}")
 
     print("\n=== 8. 命令解析兼容 JSON 数组格式 ===")
     cg2 = CommandGenerator(llm)
