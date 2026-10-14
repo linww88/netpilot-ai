@@ -145,4 +145,5 @@
   - `tests/test_topology.py`（10 项）：拓扑构建与幂等性；
   - `tests/test_topology_refresh.py`（28 项）：拓扑清空/重建不残留、LLDP 收敛等待；
   - `tests/test_no_env.py`（18 项）：无 .env 降级运行与友好提示；
+  - `tests/test_app_startup.py`（8 项）：set_page_config 顺序约束（AST + AppTest）；
   - `tests/test_deepseek_mock.py`（14 项）：LLM 调用链路 mock 验证。

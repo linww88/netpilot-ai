@@ -199,6 +199,7 @@ python tests/test_topology.py           # 拓扑构建（10 项）
 python tests/test_deepseek_mock.py      # LLM 链路 mock（14 项）
 python tests/test_topology_refresh.py   # 拓扑刷新与 LLDP 收敛（28 项）
 python tests/test_no_env.py             # 无 .env 降级运行（18 项）
+python tests/test_app_startup.py        # Streamlit 启动约束 / set_page_config 顺序（8 项）
 ```
 
 如需验证真实 DeepSeek 连通性（会消耗额度）：

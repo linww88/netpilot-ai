@@ -6,6 +6,10 @@ import sys
 import time
 from dotenv import load_dotenv 
 
+# ⚠️ st.set_page_config() 必须是脚本中第一条 Streamlit 命令，
+# 因此必须放在任何 st.* 调用（含 st.sidebar / st.session_state / st.error）之前。
+st.set_page_config(page_title="NetPilot eNSP AI 网络助手", layout="wide", page_icon="🧠")
+
 # 解决 ModuleNotFoundError: No module named 'src'
 # 将项目根目录添加到 sys.path 中
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -171,8 +175,7 @@ llm_overrides = {
 }
 device_manager, llm_client, intent_parser, command_gen, executor, tester, diagnosis, db_manager, topo_collector, topo_builder = init_components(llm_overrides)
 
-# Streamlit 界面布局
-st.set_page_config(page_title="NetPilot eNSP AI 网络助手", layout="wide", page_icon="🧠") 
+# Streamlit 界面布局（set_page_config 已在文件顶部调用，此处只渲染标题）
 st.title("🧠 NetPilot eNSP AI 网络助手") 
 
 # AI 可用性提示（缺 .env / API Key 时给出明确引导，但应用仍可继续使用）

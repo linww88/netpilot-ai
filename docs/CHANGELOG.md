@@ -4,8 +4,8 @@
 
 - 修订性质：功能新增 + 缺陷修复 + 文档更新
 - 涉及代码文件：10 个
-- 新增测试文件：6 个（共 132 项离线测试）
-- 代码规模：`src/` 约 2,800 行，`tests/` 约 1,500 行
+- 新增测试文件：7 个（共 140 项离线测试）
+- 代码规模：`src/` 约 2,800 行，`tests/` 约 1,700 行
 
 ---
 
@@ -22,9 +22,10 @@
 9. [修复：拓扑自动发现残留上一次实验的拓扑](#9-修复拓扑自动发现残留上一次实验的拓扑)
 10. [修复：全新克隆后无法启动（data 目录缺失）](#10-修复全新克隆后无法启动data-目录缺失)
 11. [新增：未配置 .env 时的优雅降级运行](#11-新增未配置-env-时的优雅降级运行)
-12. [文档更新](#12-文档更新)
-13. [测试与验证汇总](#13-测试与验证汇总)
-14. [改动文件清单](#14-改动文件清单)
+12. [修复：set_page_config 调用顺序错误导致应用无法打开](#12-修复set_page_config-调用顺序错误导致应用无法打开)
+13. [文档更新](#13-文档更新)
+14. [测试与验证汇总](#14-测试与验证汇总)
+15. [改动文件清单](#15-改动文件清单)
 ---
 
 ## 1. 大模型默认配置迁移至 DeepSeek
@@ -580,7 +581,52 @@ OpenAIError: Missing credentials. Please pass an `api_key`, ...
 
 ---
 
-## 12. 文档更新
+## 12. 修复：set_page_config 调用顺序错误导致应用无法打开
+
+### 问题现象
+
+运行应用时报错，页面无法加载：
+
+```
+StreamlitSetPageConfigMustBeFirstCommandError: set_page_config() can only be called
+once per app page, and must be called as the first Streamlit command in your script.
+```
+
+### 根因
+
+`src/main.py` 中 `st.set_page_config()` 原先位于第 175 行，
+**在其之前**（第 67 行起）已经有大量 Streamlit 命令被执行：
+
+- `with st.sidebar:` 内的 `st.subheader()` / `st.selectbox()` / `st.text_input()` / `st.checkbox()`；
+- `st.session_state` 读写；
+- 配置缺失分支中的 `st.error()` / `st.stop()`。
+
+Streamlit 强制要求 `set_page_config()` 为脚本中**第一条** Streamlit 命令，
+因此该顺序必然触发上述异常。（此问题在引入"AI 状态提示"相关改动后被暴露。）
+
+### 解决方案
+
+**`src/main.py`**
+
+- 将 `st.set_page_config(...)` **上移至文件顶部**（紧随 `import streamlit as st` 等 import 之后、
+  任何 `st.*` 调用之前），并加注释说明该约束；
+- 删除原第 175 行处的重复 `set_page_config()` 调用（该处只保留 `st.title()`）。
+
+调整后顺序为：`import` → `st.set_page_config` → 环境变量/配置加载 → 日志 → 会话状态 → 侧边栏 → …，
+符合 Streamlit 要求。
+
+### 验证
+
+- 新增 `tests/test_app_startup.py` **8/8 通过**：
+  - **静态检查（AST）**：`set_page_config` 恰好出现一次、是最早的 `st.*` 调用、
+    其之前无其他 `st.*` 命令、`with st.sidebar` 均在其之后；
+  - **运行时检查（Streamlit AppTest）**：实际执行 `src/main.py`，断言无异常抛出并成功渲染标题。
+- 实测在**无 `.env`** 的干净目录启动，AppTest 运行**无异常**，页面标题正常渲染。
+- 全量离线测试 **140/140 通过**（原 132 + 新增 8）。
+
+---
+
+## 13. 文档更新
 
 | 文件 | 更新内容 |
 | --- | --- |
@@ -594,7 +640,7 @@ OpenAIError: Missing credentials. Please pass an `api_key`, ...
 
 ---
 
-## 13. 测试与验证汇总
+## 14. 测试与验证汇总
 
 ### 离线测试套件（不依赖真实设备与网络）
 
@@ -607,7 +653,8 @@ OpenAIError: Missing credentials. Please pass an `api_key`, ...
 | `tests/test_topology.py` | 10 | hostname 归一化、无伪节点、链路正确、幂等、表头过滤 |
 | `tests/test_topology_refresh.py` | 28 | 拓扑清空与重建不残留、部分采集移除旧设备、采集失败清空图、历史加载后重建无残留、LLDP 收敛等待、行数统计 |
 | `tests/test_no_env.py` | 18 | 无 .env 降级运行：初始化不崩溃、组件可创建、内置模板可用、AI 调用抛友好异常、ENV_HINT 内容、有 Key 可用、local 免 Key |
-| **合计** | **132** | **全部通过** |
+| `tests/test_app_startup.py` | 8 | set_page_config 顺序（AST 静态检查 + Streamlit AppTest 运行时检查） |
+| **合计** | **140** | **全部通过** |
 
 ### 真实环境验证
 
@@ -621,10 +668,11 @@ OpenAIError: Missing credentials. Please pass an `api_key`, ...
 | Streamlit 应用启动 | HTTP 200，日志 0 错误 |
 | 拓扑刷新（新实验覆盖旧实验） | 28/28 离线测试通过，重建不残留历史节点与链路 |
 | 无 .env 降级运行 | 18/18 离线测试通过；无 .env 启动 Streamlit HTTP 200，AI 功能提示引导配置 |
+| set_page_config 顺序 | 8/8 离线测试通过；AppTest 实际运行无异常，标题正常渲染 |
 
 ---
 
-## 14. 改动文件清单
+## 15. 改动文件清单
 
 ### 代码文件（10 个）
 
@@ -660,6 +708,7 @@ OpenAIError: Missing credentials. Please pass an `api_key`, ...
 | `tests/test_topology.py` | 新增 |
 | `tests/test_topology_refresh.py` | 新增 |
 | `tests/test_no_env.py` | 新增 |
+| `tests/test_app_startup.py` | 新增 |
 | `tests/test_device_manager.py` | 现有文件，断言同步当前实现 |
 | `tests/test_deepseek.py` | 真实接口测试脚本 |
 
