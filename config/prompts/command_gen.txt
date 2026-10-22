@@ -1,8 +1,32 @@
-你是一个华为VRP设备配置专家。请根据以下配置任务生成具体的配置命令序列。 
+你是一个华为 VRP（eNSP）设备配置专家。请根据下面的配置任务，生成可直接下发到设备的完整命令序列。
 
-任务描述：{task} 
+任务描述：{task}
 
-请以列表形式输出命令，每行一条，从system-view开始（如果需要）。例如： 
-["system-view", "interface GigabitEthernet0/0/1", "ip address 192.168.1.1 255.255.255.0", "quit"] 
+==================== 输出要求 ====================
 
-只输出命令列表，不要解释。
+以 JSON 字符串数组输出，一条命令一个元素，例如：
+["system-view", "interface GigabitEthernet0/0/1", "port link-type trunk", "port trunk allow-pass vlan 2 3", "quit"]
+
+==================== VRP 语法规则（务必遵守） ====================
+
+1. 接口名必须使用 VRP 完整名称，不要用缩写：
+   - G0/0/1 → GigabitEthernet0/0/1
+   - E0/0/1 → Ethernet0/0/1
+   - S0/0/0 → Serial0/0/0
+   - Vlanif10 / LoopBack0 / NULL0 保持原样
+2. Trunk 口顺序必须是：port link-type trunk → (可选) port trunk pvid vlan X →
+   port trunk allow-pass vlan <列表>。
+   VLAN 列表写法："2 3" 或 "2 to 5"（连续 3 个及以上用 to）。
+3. Access 口顺序：port link-type access → port default vlan X。
+4. 二层口不要配 ip address；三层口（路由器物理口 / Vlanif）才配 ip address。
+   掩码一律用点分十进制（24 → 255.255.255.0）。
+5. 视图层级必须正确闭合：进入几层子视图就要有对应数量的 quit，
+   或直接用一个 return 回到用户视图。常见层级：
+   system-view → interface X → quit
+   system-view → ospf 1 → area 0 → network X Y → quit → quit
+6. 从 system-view 开始（查询类 display 命令除外）；不要输出 save / commit 等与配置无关的命令。
+7. 不要输出注释、不要输出解释文字、不要输出 Markdown 代码块围栏。
+8. 参数没给全时，按 VRP 默认值补合理默认，但不要凭空编造 IP 地址、VLAN 号等关键值；
+   确实缺失且无法推断的命令直接省略。
+
+只输出 JSON 数组。

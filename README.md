@@ -191,11 +191,13 @@ streamlit run src/main.py
 
 项目内置离线测试套件，**不依赖真实设备与网络**。测试分两套风格：
 
-**① pytest 风格**（用 `pytest` 收集，共 20 个用例）：
+**① pytest 风格**（用 `pytest` 收集，共 44 个用例）：
 
 ```bash
 pytest tests/                            # 一次性运行全部 pytest 用例
 # 也可单独运行：
+pytest tests/test_vrp_commands.py        # 华为 VRP 命令正确性（Trunk/Access/SVI/OSPF/路由）
+pytest tests/test_rule_parser.py         # 本地规则解析（文本 → 命令 全链路）
 pytest tests/test_app_startup.py         # Streamlit 启动约束 / set_page_config 顺序 / 禁止 expander 嵌套
 pytest tests/test_no_env.py              # 无 .env 降级运行
 pytest tests/test_topology_refresh.py    # 拓扑刷新与 LLDP 收敛
@@ -212,8 +214,9 @@ python tests/test_deepseek_mock.py      # LLM 链路 mock（14 项）
 python tests/test_deepseek.py           # LLM 契约与命令解析（14 项，默认走 mock，不消耗额度）
 ```
 
-> 说明：`pytest tests/` 只会收集到 pytest 风格的 20 个用例，脚本风格的 6 个文件需用
-> `python tests/xxx.py` 单独运行——两种方式合计 **120 个测试单元**，全部通过。
+> 说明：`pytest tests/` 收集的是 pytest 风格的 44 个用例；脚本风格的 6 个文件需用
+> `python tests/xxx.py` 单独运行——两种方式合计 **144 个测试单元**，全部通过。
+> `tests/test_vrp_commands.py` 与 `tests/test_rule_parser.py` 两种方式都能跑。
 
 如需验证真实 DeepSeek 连通性（会消耗额度），请先配置 `.env`：
 

@@ -23,6 +23,7 @@ from src.topology.visualizer import visualize_topology
 from src.ai.llm_client import LLMClient, LLMUnavailableError, ENV_HINT 
 from src.ai.intent_parser import IntentParser 
 from src.ai.command_gen import CommandGenerator 
+from src.ai.rule_parser import RuleParser
 from src.ai.fault_diagnosis import FaultDiagnosis 
 from src.executor.config_executor import ConfigExecutor 
 from src.validator.tester import Tester 
@@ -174,6 +175,9 @@ llm_overrides = {
     "api_key_env": st.session_state['llm_api_key_env'],
 }
 device_manager, llm_client, intent_parser, command_gen, executor, tester, diagnosis, db_manager, topo_collector, topo_builder = init_components(llm_overrides)
+
+# 本地规则解析器（无状态、不依赖 AI，作为 AI 不可用/无结果时的兜底）
+rule_parser = RuleParser()
 
 # Streamlit 界面布局（set_page_config 已在文件顶部调用，此处只渲染标题）
 st.title("🧠 NetPilot eNSP AI 网络助手") 
@@ -429,24 +433,40 @@ with tab1:
         parse_btn = st.button("🚀 开始解析", use_container_width=True)
     
     if parse_btn: 
-        if not _ai_available:
-            st.error(
-                "AI 功能不可用，无法解析自然语言指令。请先配置 `.env`（见页面上方提示）。\n\n"
-                "在此期间，你仍可使用「⚙️ 手动配置下发」标签页直接下发命令。"
-            )
-        elif user_input: 
+        if not user_input:
+            st.warning("请输入指令内容")
+        elif not _ai_available:
+            # 未配置 .env：改用本地规则解析（覆盖常见指令），并提示能力边界
+            _rule_tasks = rule_parser.parse(user_input)
+            if _rule_tasks:
+                st.session_state['last_parsed_tasks'] = _rule_tasks
+                st.info(
+                    "未配置 `.env`，本次由**本地规则解析**完成（支持 Trunk/Access 口、"
+                    "接口 IP、VLAN、SVI、OSPF、静态路由、查询等常见指令）。\n\n"
+                    "如需解析更复杂的表述，请配置 `.env` 启用 AI。"
+                )
+            else:
+                st.error(
+                    "AI 功能不可用，且本地规则未能识别该指令。请先配置 `.env`（见页面上方提示）。\n\n"
+                    "在此期间，你仍可使用「⚙️ 手动配置下发」标签页直接下发命令。"
+                )
+        else:
             try:
                 with st.spinner("AI 正在解析意图..."): 
-                    tasks = intent_parser.parse(user_input) 
-                    st.session_state['last_parsed_tasks'] = tasks 
+                    tasks = intent_parser.parse(user_input)
                 if not tasks:
+                    # AI 没解析出来 → 用本地规则兜底
+                    tasks = rule_parser.parse(user_input)
+                    if tasks:
+                        st.info("AI 未解析出任务，已自动改用**本地规则解析**。")
+                if tasks:
+                    st.session_state['last_parsed_tasks'] = tasks
+                else:
                     st.warning("AI 未解析出任何任务，请调整指令表述后重试。")
             except LLMUnavailableError as e:
                 st.error(f"AI 调用失败：{e}")
             except Exception as e:
                 st.error(f"解析过程出错：{e}")
-        else:
-            st.warning("请输入指令内容")
     
     if st.session_state['last_parsed_tasks']: 
         st.subheader("🤖 当前解析结果") 
@@ -477,7 +497,7 @@ with tab1:
                         st.json(_task)
                     with c2:
                         st.markdown("**⌨️ 对应华为 VRP 配置命令**")
-                        _cmds = command_gen.generate_with_comments(_task)
+                        _cmds, _cmd_warns = command_gen.generate_with_comments_ex(_task)
                         if not _cmds:
                             st.info("未能生成命令（该操作类型可能需要人工确认或补充参数）。")
                         else:
@@ -488,6 +508,8 @@ with tab1:
                                 _lines.append(f"{_i:>2}. {_cmd}"
                                               + (f"    # {_cmt}" if _cmt else ""))
                             st.code("\n".join(_lines), language="text")
+                            for _w in _cmd_warns:
+                                st.warning(_w)
                             # 注意：Streamlit 禁止 expander 嵌套 expander。
                             # 此处已位于「任务」expander 内部，故改用 popover
                             # （popover 可以嵌套，交互上也更紧凑）。

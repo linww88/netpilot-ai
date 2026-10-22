@@ -16,23 +16,44 @@
 - **自然语言 → 配置任务**
   输入一句话描述需求（例如"在 R1 和 R2 之间配置 OSPF，并在 R1 上创建 VLAN 10"），AI 自动解析为结构化任务清单，
   每项包含 `device`（目标设备）、`action`（动作类型）、`parameters`（关键参数）。
-  - 可用动作类型：`config_interface`、`config_ospf`、`config_static_route`、`config_vlan`、`config_acl`、`show_command`。
+  - 可用动作类型：`config_interface`（含 Trunk/Access/Hybrid/IP）、`config_vlanif`（SVI 网关）、
+    `config_ospf`、`config_static_route`、`config_vlan`、`config_acl`、`show_command`；
+    另支持 `config_trunk`、`config_access`、`config_svi` 等语义化别名。
   - 一条指令涉及多台设备时，为每台设备各生成一个任务对象。
 
 - **鲁棒的结果解析** ★
   LLM 返回结果经本地清洗，兼容四种常见格式：纯 JSON 数组、Markdown 代码块包裹、
   前后夹杂说明文字、模型返回单个对象或 `{"tasks": [...]}` 包装形式。
 
-- **AI 配置命令生成**
-  - **内置模板**（本地生成，稳定可复现）：接口配置、OSPF、静态路由、VLAN（单个 / 批量）、ACL（含规则）、查询命令。
-  - **大模型回退**：未注册的动作类型调用 LLM 生成华为 VRP 命令序列。
+- **本地规则解析（无需 AI）** ★
+  `RuleParser` 用正则确定性解析常见中文指令，不依赖大模型与网络：
+  - 覆盖 Trunk / Access / Hybrid 口、接口 IP、VLAN 三层接口（SVI）、
+    创建 VLAN（单个/批量/区间）、OSPF（支持一条指令多设备）、静态路由、查询命令；
+  - 未配置 `.env` 时直接启用，并提示"本次由本地规则解析完成"；
+  - AI 已配置但未解析出任务时自动兜底，避免"解析失败就完全不可用"。
+
+- **AI 配置命令生成** ★
+  - **内置模板**（本地生成，稳定可复现）：
+    - 接口：IP 地址、描述、链路类型（`access` / `trunk` / `hybrid`）、
+      Access 默认 VLAN、Trunk 放通 VLAN 与 PVID、`shutdown` / `undo shutdown`；
+    - VLAN 三层接口（`Vlanif` / SVI）网关地址；
+    - VLAN 单个创建与批量创建（`vlan batch`，连续区间自动压缩为 `a to b`）；
+    - OSPF（进程、区域、`network`，支持 `10.0.0.0/24` 前缀写法）、静态路由、ACL（含命名 ACL）、查询命令。
+  - **名称归一化**：`G0/0/1`、`GE0/0/1`、`GE 0/0/1` 统一展开为 `GigabitEthernet0/0/1`，
+    `E0/0/1` → `Ethernet0/0/1`，`S0/0/0` → `Serial0/0/0`，避免缩写不被 VRP 接受。
+  - **VLAN 写法兼容**：`2`、`[2,3]`、`2,3`、`2、3`、`2，3`、`2 3`、`vlan2、3`、
+    `2-5`、`2 to 5`、`2至5` 共 11 种写法。
+  - **视图层级正确闭合**：进入几层子视图就有对应数量的 `quit`（如 OSPF 的 `area` 视图）。
+  - **大模型回退**：未注册的动作类型调用 LLM 生成；模板未覆盖的参数也会回退 LLM，
+    无 LLM 时在界面提示"哪些参数未被使用，结果可能不完整"，**不再静默丢配置**。
   - 命令生成解析兼容「每行一条」与「JSON 数组」两种返回格式。
 
 - **命令注释预览** ★
   `generate_with_comments()` 在生成命令的同时产出逐条中文注释，**不额外调用大模型**：
   - 按命令前缀分类注释（`system-view` / `interface` / `ip address` / `vlan` / `ospf` / `area` / `network` /
-    `ip route-static` / `acl` / `rule` / `description` / `display` / `undo` 等）；
-  - `quit` 注释按**视图嵌套深度**推导（"退出至用户视图" / "返回上一级视图"）；
+    `ip route-static` / `acl` / `rule` / `description` / `display` / `undo` /
+    `port link-type` / `port trunk allow-pass vlan` / `port default vlan` 等）；
+  - `quit` 注释按**视图嵌套深度**推导（"退出至用户视图" / "返回系统视图" / "返回上一级视图"）；
   - 未知操作回退按动作类型给出语义化说明。
 
 - **故障诊断与修复建议**
@@ -140,7 +161,9 @@
 - **离线测试套件** ★
   提供不依赖真实设备与网络的测试，分 pytest 与脚本两种风格：
 
-  *pytest 风格（`pytest tests/`，20 个用例）：*
+  *pytest 风格（`pytest tests/`，44 个用例）：*
+  - `tests/test_vrp_commands.py`：VRP 命令正确性（Trunk/Access/SVI/OSPF/路由/名称与 VLAN 归一化）；
+  - `tests/test_rule_parser.py`：本地规则解析（文本 → 任务 → 命令 全链路）；
   - `tests/test_topology_refresh.py`：拓扑清空/重建不残留、LLDP 收敛等待；
   - `tests/test_no_env.py`：无 .env 降级运行与友好提示；
   - `tests/test_app_startup.py`：set_page_config 顺序约束、**禁止 expander 嵌套**（AST + AppTest）。

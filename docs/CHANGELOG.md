@@ -679,7 +679,126 @@ with st.popover(f"📖 命令逐条注释（共 {len(_cmds)} 条）",
 
 ---
 
-## 14. 文档更新
+## 14. 修复：自然语言指令生成的 VRP 命令错误且不完整
+
+### 现象
+
+输入「配置S1上的G0/0/1接口为Trunk接口，允许vlan2、3通过」，生成的命令只有：
+
+```
+system-view
+interface G0/0/1
+quit
+```
+
+**完全丢失了 Trunk 的核心配置**（`port link-type trunk`、`port trunk allow-pass vlan 2 3`），
+下发后端口仍是默认的 Access 类型，配置不生效。其他类型的指令也存在类似问题
+（Access 口、接口描述、SVI 等参数被丢弃）。
+
+### 根因（三层叠加）
+
+1. **模板层丢参数**：`_gen_interface()` 只读取 `ip` / `mask` 两个参数，
+   其余参数（`link_type`、`allowed_vlans`、`default_vlan`、`description`…）
+   被**静默丢弃**，既不报错也不提示。
+2. **意图提示词太窄**：`intent_parser.txt` 只定义 6 种 action，且把 `config_interface`
+   描述为"接口IP配置"，LLM 根本没有 `link_type` / `allowed_vlans` 这两个字段的概念，
+   自然不会输出它们——即使模板支持也无参数可用。
+3. **视图层级未闭合**：`_gen_ospf()` 进入 `area` 视图后只 `quit` 一次，
+   实际停在 OSPF 视图，导致后续命令层级错乱。
+
+### 修复
+
+**① 重写命令模板（`src/ai/command_gen.py`）**
+
+- `_gen_interface()` 全面覆盖：`link_type`（access/trunk/hybrid）、
+  `allowed_vlans`、`default_vlan`、`pvid`、`description`、`ip`/`mask`、
+  `shutdown`/`undo shutdown`；未给类型但给了 VLAN 时自动推导为 Access。
+- 新增 `_gen_vlanif()`：SVI 配置（`vlan N` → `interface VlanifN` → `ip address`）。
+- 新增 action 别名：`config_trunk` / `config_access` / `config_svi` 等，
+  并按 action 名自动补齐隐含的 `link_type`。
+- 修正 `_gen_ospf()`：`area` 与进程各闭合一个 `quit`，命令不再停在子视图。
+- 静态路由支持 `192.168.2.0/24` 前缀写法，自动转掩码。
+- ACL 支持命名 ACL 与 basic/advanced 类型。
+
+**② 名称与参数归一化**
+
+- `_normalize_interface()`：`G0/0/1`、`g0/0/1`、`GE0/0/1`、`GE 0/0/1`
+  → `GigabitEthernet0/0/1`；`E0/0/1` → `Ethernet0/0/1`；
+  `S0/0/0` → `Serial0/0/0`；`XGE` → `XGigabitEthernet`（幂等）。
+- `_parse_vlan_ids()`：支持 `2`、`[2,3]`、`"2,3"`、`"2、3"`、`"2，3"`、
+  `"2 3"`、`"vlan2、3"`、`"2-5"`、`"2 to 5"`、`"2至5"` 等 11 种写法。
+- `_vlan_segments()`：连续 3 个及以上压缩为 `a to b`，符合 VRP 的 10 段上限。
+
+**③ 重写意图解析提示词（`config/prompts/intent_parser.txt`）**
+
+- 为每种 action 明确列出**参数名与取值规范**（尤其 `link_type`、`allowed_vlans`）。
+- 新增 Trunk / Access / SVI / 批量 VLAN 等 7 个示例，
+  其中示例 1 直接采用用户报错的原句。
+- 规则中强调"提到 Trunk 必须输出 `link_type=trunk` 并把 VLAN 转成整数数组"。
+
+**④ 重写命令生成提示词（`config/prompts/command_gen.txt`）**
+
+- 补充 VRP 语法约束：接口名必须完整、Trunk 命令顺序、二层口不配 IP、
+  视图层级必须闭合、不得编造 IP/VLAN。
+- 统一要求输出 JSON 数组（与解析器一致）。
+
+**⑤ 新增本地规则解析器（`src/ai/rule_parser.py`）**
+
+即使不依赖大模型，常见指令也能被确定性解析，从而生成正确命令：
+
+- 覆盖：Trunk / Access / Hybrid 口、接口 IP、VLAN 三层接口（SVI）、
+  创建 VLAN（单个/批量/区间）、OSPF（可多设备）、静态路由、查询命令。
+- 在 `src/main.py` 中作为兜底接入：
+  - 未配置 `.env` → 直接用规则解析，并提示"本次由本地规则解析完成"；
+  - AI 已配置但未解析出任务 → 自动改用规则解析。
+- `IntentParser.parse()` 的既有契约（无 Key 时抛 `LLMUnavailableError`）**保持不变**，
+  兜底逻辑放在 UI 层，不影响原有测试与错误提示。
+
+**⑥ 不再静默丢参数**
+
+- 新增 `_leftover_keys()`：检测模板未消费的参数。
+  有 LLM 时自动回退 LLM 生成完整命令；无 LLM 时在界面给出告警，
+  明确告知"哪些参数未被使用，结果可能不完整"。
+- 新增 `generate_with_comments_ex()`，额外返回告警列表，UI 以 `st.warning` 展示。
+
+### 验证
+
+- 新增 `tests/test_vrp_commands.py`（**31 项**）：覆盖用户原例、VLAN 区间、
+  Access、仅 VLAN 推导、接口 IP、`/24` 前缀、SVI、批量 VLAN、OSPF 层级、
+  静态路由前缀、11 种接口名写法、11 种 VLAN 写法、未覆盖参数告警、空命令检查。
+- 新增 `tests/test_rule_parser.py`（**32 项**）：文本 → 任务 → 命令 全链路，
+  含用户原句、Access、IP、SVI、批量 VLAN、OSPF 多设备、静态路由、
+  查询命令、无法识别文本、缺设备名不臆造。
+- **真实模型验证**（DeepSeek，非 mock）：6 类指令全部输出正确且完整：
+
+  | 输入指令 | 生成命令 |
+  | --- | --- |
+  | 配置S1上的G0/0/1接口为Trunk接口，允许vlan2、3通过 | `interface GigabitEthernet0/0/1` / `port link-type trunk` / `port trunk allow-pass vlan 2 3` |
+  | 把S2的E0/0/2端口设为Access口，划入VLAN 20 | `interface Ethernet0/0/2` / `port link-type access` / `port default vlan 20` |
+  | 在R1的G0/0/1接口配置IP地址192.168.1.1/24，描述为to-R2 | `description to-R2` / `ip address 192.168.1.1 255.255.255.0` |
+  | 在S1上创建VLAN 10到20 | `vlan batch 10 to 20` |
+  | 在S1上配置VLAN 30的网关地址192.168.30.1/24 | `vlan 30` / `interface Vlanif30` / `ip address ...` |
+  | 在R1上配置静态路由，目的192.168.5.0/24，下一跳10.0.0.2 | `ip route-static 192.168.5.0 255.255.255.0 10.0.0.2` |
+
+- **端到端验证**：用 Streamlit `AppTest` 在真实界面里填入用户原句并点击「开始解析」，
+  界面输出：
+  ```
+  1. system-view                              # 进入系统视图（配置模式）
+  2. interface GigabitEthernet0/0/1           # 进入接口 GigabitEthernet0/0/1 视图
+  3. port link-type trunk                     # 设置端口链路类型为 Trunk（干道）
+  4. port trunk allow-pass vlan 2 3           # 允许 VLAN 2 3 通过（tagged）
+  5. quit                                      # 返回系统视图
+  ```
+  运行**无异常**；另用清空 Key 的方式验证了"无 AI 时走本地规则解析"分支，
+  同样输出上述 5 条命令，并显示"本次由本地规则解析完成"的提示。
+- 修正 `test_command_comments.py` 中一条**语义错误**的断言：
+  `system-view → interface → quit` 实际回到**系统视图**而非用户视图，
+  旧断言与旧注释逻辑同时有误，一并纠正。
+- 全量离线测试通过：pytest **44 项** + 脚本 **100 项** = **144 个测试单元**。
+
+---
+
+## 15. 文档更新
 
 | 文件 | 更新内容 |
 | --- | --- |
@@ -693,7 +812,7 @@ with st.popover(f"📖 命令逐条注释（共 {len(_cmds)} 条）",
 
 ---
 
-## 15. 测试与验证汇总
+## 16. 测试与验证汇总
 
 ### 离线测试套件（不依赖真实设备与网络）
 
@@ -725,7 +844,7 @@ with st.popover(f"📖 命令逐条注释（共 {len(_cmds)} 条）",
 
 ---
 
-## 16. 改动文件清单
+## 17. 改动文件清单
 
 ### 代码文件（10 个）
 

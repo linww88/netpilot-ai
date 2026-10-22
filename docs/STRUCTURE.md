@@ -21,6 +21,7 @@ netpilot-ai/
 │  │  ├─ llm_client.py      # LLM 调用封装（DeepSeek / OpenAI 兼容 / Ollama）
 │  │  ├─ intent_parser.py   # 自然语言 → 任务列表（含多格式容错解析）
 │  │  ├─ command_gen.py     # 任务 → VRP 命令 + 带注释的命令预览
+│  │  ├─ rule_parser.py     # 本地规则解析（不依赖 AI 的兜底解析器）
 │  │  └─ fault_diagnosis.py # 故障诊断与修复建议
 │  │
 │  ├─ connection/           # 设备连接与会话管理

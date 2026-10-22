@@ -36,8 +36,8 @@ def main():
           "ip address 10.0.0.1 255.255.255.0" in cmds, str(cmds))
     check("每条命令都有注释", all(i["comment"] for i in items),
           str([i["comment"] for i in items]))
-    check("末条 quit 注释为退出至用户视图",
-          items[-1]["comment"] == "退出至用户视图", items[-1]["comment"])
+    check("末条 quit 注释为返回系统视图",
+          items[-1]["comment"] == "返回系统视图", items[-1]["comment"])
 
     print("\n=== 2. OSPF：区域与网段注释 ===")
     ospf = g.generate_with_comments({
