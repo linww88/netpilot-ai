@@ -901,7 +901,65 @@ quit
 
 ---
 
-## 17. 文档更新
+## 17. 修复：故障诊断把「VLAN 已配置」误判为「未配置」
+
+### 问题现象
+
+输入「不考虑S1的vlanif接口的配置情况下请分析S1的vlan配置是否成功」，输出：
+
+> S1 的 VLAN 配置未成功。S1 上仅存在默认 Vlanif1 接口，且其 Protocol 状态为 down，未创建任何业务
+> VLAN 及其对应的 Vlanif 接口。同时 S1 的物理接口（如 MEth0/0/1）处于 down 状态……
+
+而设备上 `vlan batch 2 3`、`G0/0/1 port link-type trunk`、`port trunk allow-pass vlan 2 to 3`
+均已配置成功。
+
+### 根因（三层叠加）
+
+1. **采集范围只有三层**：`src/main.py` 固定只跑 `display ip routing-table` 与
+   `display ip interface brief`。VLAN 是二层配置，且 S1 没给这些 VLAN 配 IP，
+   `display ip interface brief` 里根本不会出现它们 —— 模型把「输出里没看到」当成
+   「设备上没有」，即典型的「证据缺失 = 否定证据」谬误。
+2. **提示词缺少证据约束**：`config/prompts/fault_diagnosis.txt` 只说"请分析故障原因"，
+   没要求区分「未采集」与「未配置」，也没要求给出置信度与证据缺口；模型必须给出解释，
+   于是用"仅存在默认 Vlanif1"这类推断填空。
+3. **不尊重用户前提**：用户已声明「不考虑 S1 的 vlanif 接口」，模型仍用 Vlanif1 down 反证；
+   同时把管理口 `MEth0/0/1` down 当作业务故障判据。
+4. **附带缺陷**：提示词要求输出 `confidence`，UI 却读 `risk_level`，风险等级永远显示 `Unknown`。
+
+### 解决方案
+
+- **采集层**（`build_collect_commands()`）：基础采集改为 `display vlan` / `display port vlan` /
+  `display interface brief` / `display ip interface brief` / `display ip routing-table`；
+  命中「配置 / VLAN / Trunk / 单臂 / OSPF / STP / MAC / ARP / VRRP / DHCP」等关键词时追加
+  `display current-configuration` 等命令。`display current-configuration` 是唯一能直接证明
+  「配置是否写入」的证据。
+- **解析层**（新增 `parse_vlan_table` / `parse_port_vlan` / `parse_interface_brief` /
+  `parse_ip_interface_brief` / `parse_config_blocks` / `summarize_evidence`）：
+  由程序把回显确定性地解析成事实，例如 `VLAN 2（端口：UT:GE0/0/2(U)）`、
+  `VLAN 3（已创建，无端口加入）`、`GigabitEthernet0/0/1 = trunk、PVID 1、允许 VLAN 2-3`、
+  `vlan batch 2 3`。模型只基于事实归因，不再靠上下文猜。
+- **证据缺口标注**：本次应采集却没执行的命令、回显为空的命令，一律写入 `evidence_gaps`，
+  并明确标注「不能据此判断『未配置』」。
+- **提示词重写**：证据优先级（事实 > 回显 > 推断）、禁止「没看到 = 没有」、分层取证
+  （二层看 `display vlan` / `display port vlan`）、管理口与空闲口不作判据、严格遵守用户前提、
+  是非题先给结论；输出新增 `conclusion` / `evidence` / `evidence_gaps` / `verify_commands`。
+- **UI**：展示结论（配置成功/失败/证据不足）、置信度、逐条证据、证据缺口、修复步骤与复核命令，
+  新增「🧾 查看本次采集的证据原文」供人工核对；修复 `risk_level` 恒为 `Unknown` 的字段错配。
+
+### 验证
+
+- 离线：新增 `tests/test_fault_diagnosis.py` 69 项（采集命令选取、五类回显解析、事实生成、
+  缺口标注、提示词契约、端到端 Mock、旧结构兼容、非 JSON 降级）；`pytest tests/` 68 passed。
+- 真实 DeepSeek：
+  - **正例**（VLAN 2/3 已创建 + trunk 放通）→ `conclusion=配置成功`，置信度高，
+    证据逐条对应命令输出，并明确「按用户要求，未对 S1 的 Vlanif 接口配置作任何分析或反证」，
+    未再拿 `MEth0/0/1` down 说事。
+  - **反例**（只有默认 VLAN 1、配置为空）→ `conclusion=配置失败`，置信度高，
+    依据 `display vlan` 仅 VLAN 1、`display current-configuration` 无 VLAN 相关行。
+
+---
+
+## 18. 文档更新
 
 | 文件 | 更新内容 |
 | --- | --- |
@@ -915,7 +973,7 @@ quit
 
 ---
 
-## 18. 测试与验证汇总
+## 19. 测试与验证汇总
 
 ### 离线测试套件（不依赖真实设备与网络）
 
@@ -931,7 +989,8 @@ quit
 | `tests/test_app_startup.py` | 9 | set_page_config 顺序、**禁止 expander 嵌套**（AST 静态检查 + Streamlit AppTest 运行时检查） |
 | `tests/test_vrp_commands.py` | 51 | Trunk / Access / Hybrid / SVI / OSPF / 静态路由的命令正确性，**单臂路由 dot1q 子接口**（含 ARP 兜底），接口名与 VLAN 写法归一化 |
 | `tests/test_rule_parser.py` | 44 | 本地规则解析（无 AI 兜底）：设备抽取、接口/VLAN/IP/OSPF/路由、**单臂路由子接口**识别 |
-| **合计** | **241** | **全部通过**（pytest 收集到 51 个测试函数，其余为脚本风格断言） |
+| `tests/test_fault_diagnosis.py` | 69 | **故障诊断证据链**：采集命令按问题类型选取、`display vlan`/`display port vlan`/接口/配置块解析、事实生成、证据缺口标注、提示词契约、端到端 Mock、旧结构兼容、非 JSON 降级 |
+| **合计** | **310** | **全部通过**（pytest 收集到 68 个测试函数，其余为脚本风格断言） |
 
 ### 真实环境验证
 
@@ -948,10 +1007,11 @@ quit
 | set_page_config 顺序 | 8/8 离线测试通过；AppTest 实际运行无异常，标题正常渲染 |
 | 移除所有设备 | 17/17 离线测试通过；AppTest 实跑「点击 → 取消 → 再点击 → 确认」三条路径，0 异常，设备数归零 |
 | 单臂路由子接口 | 真实 DeepSeek + 本地规则双路径输出一致，两个子接口均带 `arp broadcast enable`；AppTest 端到端 0 异常 |
+| 故障诊断（VLAN 是否配置成功） | 真实 DeepSeek 正例判为「配置成功」、反例判为「配置失败」，均附逐条证据；离线 69 项通过 |
 
 ---
 
-## 19. 改动文件清单
+## 20. 改动文件清单
 
 ### 代码文件（10 个）
 
@@ -960,7 +1020,7 @@ quit
 | `config/config.yaml` | DeepSeek 默认配置、扫描参数、Provider 预设 |
 | `src/ai/llm_client.py` | 多 Provider 架构、参数解析重写、**无 Key 降级模式与 `LLMUnavailableError`** |
 | `src/ai/intent_parser.py` | JSON 提取容错（四种形态）、**AI 不可用时异常上抛** |
-| `src/ai/fault_diagnosis.py` | **AI 不可用时异常上抛**，其余异常结构化返回 |
+| `src/ai/fault_diagnosis.py` | **AI 不可用时异常上抛**，其余异常结构化返回；**分层证据采集 `build_collect_commands()`、五类回显解析器、`summarize_evidence()` 确定性事实、证据缺口标注、结果字段归一化** |
 | `src/ai/command_gen.py` | 修复 `{task}` KeyError、补齐模板、命令注释预览、**AI 异常放行**、**dot1q 子接口模板与 `_ensure_dot1q_arp()` 全局兜底** |
 | `src/connection/device_manager.py` | 端口扫描、设备识别、自动命名、名称解析、会话恢复、回显清理、配置读取、**批量移除 `remove_all_devices()`** |
 | `src/executor/config_executor.py` | 设备名解析、未匹配任务记录 |
@@ -968,7 +1028,7 @@ quit
 | `src/topology/collector.py` | 新增 LLDP 收敛等待 `wait_lldp_convergence()` 与邻居行数统计 |
 | `src/topology/visualizer.py` | 中文字体、节点标签 |
 | `src/utils/db.py` | 元信息字段、旧库自动迁移、**清空设备表 `delete_all_devices()`** |
-| `src/main.py` | 侧边栏扫描 UI、设备卡片、**移除所有设备（二次确认）**、解析双视图、执行结果渲染、配置读取 UI、拓扑页刷新/清空/收敛等待 |
+| `src/main.py` | 侧边栏扫描 UI、设备卡片、**移除所有设备（二次确认）**、解析双视图、执行结果渲染、配置读取 UI、拓扑页刷新/清空/收敛等待、**故障诊断按问题类型采集证据 + 结论/证据/缺口/复核命令渲染 + 证据原文展开** |
 
 ### 提示词文件（2 个）
 
@@ -976,8 +1036,9 @@ quit
 | --- | --- |
 | `config/prompts/intent_parser.txt` | 新增解析规则（必须解析设备名、多设备分别生成、禁止代码块）、**`config_subinterface` 规范与示例 8** |
 | `config/prompts/command_gen.txt` | 占位符与代码调用对齐、**dot1q 子接口命令顺序与 ARP 必需规则** |
+| `config/prompts/fault_diagnosis.txt` | **重写**：证据优先级、禁止「没看到 = 没有」、分层取证、管理口不作判据、尊重用户前提、结论/证据/证据缺口/复核命令输出规范 |
 
-### 测试文件（6 个，其中 5 个新增）
+### 测试文件（13 个，其中 10 个新增）
 
 | 文件 | 状态 |
 | --- | --- |
@@ -990,6 +1051,7 @@ quit
 | `tests/test_app_startup.py` | 新增 |
 | `tests/test_device_manager.py` | 现有文件，断言同步当前实现 |
 | `tests/test_deepseek.py` | 真实接口测试脚本 |
+| `tests/test_fault_diagnosis.py` | 新增（66 项，故障诊断证据链） |
 
 ### 环境与文档
 

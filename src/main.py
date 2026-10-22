@@ -24,7 +24,12 @@ from src.ai.llm_client import LLMClient, LLMUnavailableError, ENV_HINT
 from src.ai.intent_parser import IntentParser 
 from src.ai.command_gen import CommandGenerator 
 from src.ai.rule_parser import RuleParser
-from src.ai.fault_diagnosis import FaultDiagnosis 
+from src.ai.fault_diagnosis import (
+    FaultDiagnosis,
+    build_collect_commands,
+    build_collect_manifest,
+    summarize_evidence,
+) 
 from src.executor.config_executor import ConfigExecutor 
 from src.validator.tester import Tester 
 from src.utils.logger import setup_logger 
@@ -960,12 +965,13 @@ with tab4:
             if not all_devs:
                 st.warning("请先添加设备以供 AI 采集诊断数据")
             else:
-                with st.spinner("正在采集诊断上下文信息 (路由表/接口状态)..."): 
+                # 按故障描述挑选采集命令：VLAN/Trunk/配置类问题必须带二层证据，
+                # 只采三层命令会把「没看到 VLAN」误判成「VLAN 未配置」。
+                collect_cmds = build_collect_commands(fault_desc)
+                with st.spinner(
+                    f"正在采集诊断上下文（{len(collect_cmds)} 条命令 × {len(all_devs)} 台设备）..."
+                ): 
                     # 并发采集所有设备的关键诊断信息
-                    collect_cmds = [
-                        "display ip routing-table",
-                        "display ip interface brief",
-                    ]
                     batch_results = device_manager.execute_batch(
                         device_names=all_devs,
                         commands=collect_cmds,
@@ -973,14 +979,21 @@ with tab4:
                     )
                     device_outputs = {}
                     for dev, cmd_res in batch_results.items():
-                        device_outputs[dev] = {
-                            "routing": cmd_res.get("display ip routing-table"),
-                            "interfaces": cmd_res.get("display ip interface brief"),
-                        }
+                        device_outputs[dev] = {cmd: cmd_res.get(cmd) for cmd in collect_cmds}
+
+                    # 留档：便于用户在页面上核对「到底采到了什么」
+                    st.session_state['diag_context'] = {
+                        "commands": collect_cmds,
+                        "outputs": device_outputs,
+                        "manifest": build_collect_manifest(collect_cmds, device_outputs),
+                        "facts": summarize_evidence(device_outputs, collect_cmds),
+                    }
 
                     try:
                         with st.spinner("AI 专家正在分析根因并生成修复方案..."): 
-                            diag_result = diagnosis.diagnose(fault_desc, device_outputs) 
+                            diag_result = diagnosis.diagnose(
+                                fault_desc, device_outputs, collect_commands=collect_cmds
+                            ) 
                             st.session_state['diag_result'] = diag_result 
                     except LLMUnavailableError as e:
                         st.error(f"AI 诊断失败：{e}")
@@ -992,17 +1005,65 @@ with tab4:
     if 'diag_result' in st.session_state:
         res = st.session_state['diag_result']
         st.subheader("🔬 诊断分析报告")
+
+        # 结论（是非题先给结论，避免"未发现"被当成判断）
+        conclusion = (res.get('conclusion') or '').strip()
+        if conclusion:
+            if '失败' in conclusion:
+                st.error(f"**结论**：{conclusion}")
+            elif '成功' in conclusion:
+                st.success(f"**结论**：{conclusion}")
+            else:
+                st.warning(f"**结论**：{conclusion}")
+
         st.write(f"**分析详情**: {res.get('analysis', '无数据')}")
-        st.write(f"**风险等级**: `{res.get('risk_level', 'Unknown')}`")
-        
-        st.subheader("🛠️ 修复建议命令")
+        col_cf, col_risk = st.columns(2)
+        with col_cf:
+            st.write(f"**置信度**: `{res.get('confidence', '未标注')}`")
+        with col_risk:
+            st.write(f"**风险等级**: `{res.get('risk_level', '未标注')}`")
+
+        if res.get('evidence'):
+            st.markdown("**支撑证据**")
+            for item in res['evidence']:
+                st.markdown(f"- {item}")
+
+        if res.get('evidence_gaps'):
+            st.warning("**证据缺口（本次未采集到，不能据此判断为『未配置』）**\n\n"
+                       + "\n".join(f"- {g}" for g in res['evidence_gaps']))
+
+        st.subheader("🛠️ 修复建议")
         if res.get('suggestions'):
-            st.code("\n".join(res['suggestions']))
+            for i, step in enumerate(res['suggestions'], 1):
+                st.markdown(f"{i}. {step}")
+        else:
+            st.info("AI 未给出修复步骤（可能判定配置本身正确）")
+
+        if res.get('auto_fix_commands'):
+            st.markdown("**可下发的修复命令**")
+            st.code("\n".join(res['auto_fix_commands']))
             if st.button("🚀 自动应用修复配置"):
                 # 这里可以根据建议自动执行，为了安全暂时仅展示
                 st.info("自动应用功能待进一步确认安全策略后开启")
-        else:
-            st.info("AI 未能生成具体的修复命令，请手动核查")
+
+        if res.get('verify_commands'):
+            st.markdown("**复核命令**")
+            st.code("\n".join(res['verify_commands']))
+
+        ctx = st.session_state.get('diag_context')
+        if ctx:
+            with st.expander("🧾 查看本次采集的证据原文（核对 AI 结论用）", expanded=False):
+                st.markdown("**采集命令与覆盖范围**")
+                st.code(ctx.get('manifest', ''))
+                if ctx.get('facts'):
+                    st.markdown("**程序解析出的关键事实**")
+                    st.code(ctx.get('facts', ''))
+                st.markdown("**设备原始回显**")
+                for dev, cmd_res in (ctx.get('outputs') or {}).items():
+                    st.markdown(f"*{dev}*")
+                    for cmd, output in cmd_res.items():
+                        st.markdown(f"`$ {cmd}`")
+                        st.text(output if output else "未采集到回显")
 
 # 底部页脚
 st.markdown("---") 

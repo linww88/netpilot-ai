@@ -258,13 +258,28 @@
 
 1. 在「⚠️ 故障现象描述」中尽量详细描述，例如：
    > `R1 无法 ping 通 R2，但是 R1 接口状态是 UP，R2 侧看不到任何 ARP 表项`
+
+   也支持「是非题」式提问，例如：
+   > `不考虑S1的vlanif接口的配置情况下请分析S1的vlan配置是否成功`
 2. 点击「🩺 开始 AI 诊断」。系统会：
-   - 并发采集所有设备的 `display ip routing-table` 与 `display ip interface brief`；
+   - **按问题类型挑选采集命令**：基础采集 `display vlan`、`display port vlan`、
+     `display interface brief`、`display ip interface brief`、`display ip routing-table`；
+     命中「配置 / VLAN / Trunk / OSPF / STP / MAC / ARP / VRRP / DHCP」等关键词时，
+     自动追加 `display current-configuration` 等命令；
+   - 先把回显解析成**确定性事实**（哪些 VLAN 已创建、端口链路类型与允许列表、接口状态、
+     配置命令行），再交给 AI 归因，避免 AI 凭上下文猜测；
    - 调用 AI 结合采集数据与你的描述进行分析。
 3. 页面展示「🔬 诊断分析报告」：
-   - 分析详情；
-   - 风险等级（如 `Medium`）；
-   - 「🛠️ 修复建议命令」列表，可复制后到「手动 CLI 命令下发」中执行验证。
+   - **结论**（配置成功 / 配置失败 / 证据不足）与**置信度**；
+   - 分析详情、风险等级；
+   - **支撑证据**（逐条对应到某条命令的输出）与**证据缺口**
+     （本次未采集到的维度，会明确标注"不能据此判断未配置"）；
+   - 修复步骤、可下发的修复命令、复核命令。
+4. 展开「🧾 查看本次采集的证据原文」，可核对 AI 结论与真实回显是否一致。
+
+> 提示：`display ip interface brief` 只显示**配置了 IP 的三层接口**，
+> 未配 IP 的 VLAN 不会出现在其中。判断 VLAN 是否配置成功请看
+> `display vlan` / `display port vlan` / `display current-configuration`。
 
 ---
 

@@ -184,40 +184,53 @@ streamlit run src/main.py
 
 ### 第六步：网络故障分析（标签页 4「🔍 故障分析排错」）
 
-1. 详细描述故障现象（设备名、方向、是否 ping 通、接口状态等）。
-2. 点击「🩺 开始 AI 诊断」。
-3. 查看诊断分析报告、风险等级与修复建议命令。
+1. 详细描述故障现象或疑问（设备名、方向、是否 ping 通、接口状态；也支持「S1 的 VLAN 是否配置成功」这类是非题）。
+2. 点击「🩺 开始 AI 诊断」。系统会**按问题类型自动挑选采集命令**：
+   基础采集 `display vlan` / `display port vlan` / `display interface brief` /
+   `display ip interface brief` / `display ip routing-table`；涉及配置、VLAN、Trunk、OSPF 等
+   关键词时自动追加 `display current-configuration`、`display ospf peer brief` 等。
+3. 查看诊断报告：**结论**（配置成功/失败/证据不足）、置信度、风险等级、逐条证据、
+   证据缺口、修复建议与复核命令。
+4. 展开「🧾 查看本次采集的证据原文」，可核对 AI 结论是否与真实回显一致。
+
+> 二层问题（VLAN/Trunk）只看 `display ip interface brief` 是看不到证据的 ——
+> 该命令仅列出已配 IP 的三层接口。程序会显式标注「采集边界」，
+> 并把未采集到的维度记为「证据缺口」而不是「未配置」。
 
 ## 运行测试
 
 项目内置离线测试套件，**不依赖真实设备与网络**。测试分两套风格：
 
-**① pytest 风格**（用 `pytest` 收集，共 44 个用例）：
+**① pytest 风格**（用 `pytest` 收集，共 68 个用例）：
 
 ```bash
 pytest tests/                            # 一次性运行全部 pytest 用例
 # 也可单独运行：
 pytest tests/test_vrp_commands.py        # 华为 VRP 命令正确性（Trunk/Access/SVI/OSPF/路由）
 pytest tests/test_rule_parser.py         # 本地规则解析（文本 → 命令 全链路）
+pytest tests/test_fault_diagnosis.py     # 故障诊断证据链（VLAN 已配置不得被判为未配置）
 pytest tests/test_app_startup.py         # Streamlit 启动约束 / set_page_config 顺序 / 禁止 expander 嵌套
 pytest tests/test_no_env.py              # 无 .env 降级运行
 pytest tests/test_topology_refresh.py    # 拓扑刷新与 LLDP 收敛
 ```
 
-**② 脚本风格**（用 `python` 逐个运行，共 100 项断言）：
+**② 脚本风格**（用 `python` 逐个运行，带自检汇总）：
 
 ```bash
 python tests/test_device_scan.py        # 端口扫描与设备命名（29 项）
 python tests/test_command_comments.py   # 命令注释生成（21 项）
-python tests/test_device_manager.py     # 连接/会话/配置下发（12 项）
+python tests/test_device_manager.py     # 连接/会话/配置下发/移除全部设备（17 项）
 python tests/test_topology.py           # 拓扑构建（10 项）
 python tests/test_deepseek_mock.py      # LLM 链路 mock（14 项）
 python tests/test_deepseek.py           # LLM 契约与命令解析（14 项，默认走 mock，不消耗额度）
+python tests/test_fault_diagnosis.py    # 故障诊断证据链（69 项）
+python tests/test_vrp_commands.py       # VRP 命令（51 项）
+python tests/test_rule_parser.py        # 规则解析（44 项）
 ```
 
-> 说明：`pytest tests/` 收集的是 pytest 风格的 44 个用例；脚本风格的 6 个文件需用
-> `python tests/xxx.py` 单独运行——两种方式合计 **144 个测试单元**，全部通过。
-> `tests/test_vrp_commands.py` 与 `tests/test_rule_parser.py` 两种方式都能跑。
+> 说明：`pytest tests/` 收集 68 个用例；脚本风格的各文件用 `python tests/xxx.py` 单独运行并输出
+> `通过/总数`。`test_vrp_commands.py`、`test_rule_parser.py`、`test_fault_diagnosis.py`
+> 三种文件两种方式都能跑。
 
 如需验证真实 DeepSeek 连通性（会消耗额度），请先配置 `.env`：
 

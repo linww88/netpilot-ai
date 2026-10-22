@@ -64,9 +64,16 @@
   - 未知操作回退按动作类型给出语义化说明。
 
 - **故障诊断与修复建议**
-  - 输入故障现象描述（例如"R1 无法 ping 通 R2，但是接口状态是 UP"）。
-  - 系统并发采集每台设备的路由表与接口状态。
-  - AI 结合采集数据给出诊断分析、风险等级与修复建议命令列表。
+  - 输入故障现象或疑问（例如"R1 无法 ping 通 R2，但是接口状态是 UP"、"S1 的 VLAN 配置是否成功"）。
+  - **按问题类型自动选取采集命令**：基础采集 `display vlan` / `display port vlan` /
+    `display interface brief` / `display ip interface brief` / `display ip routing-table`；
+    命中配置、VLAN、Trunk、OSPF、STP、MAC、ARP、VRRP、DHCP 等关键词时追加
+    `display current-configuration` 等命令。
+  - **确定性事实解析**：程序先把回显解析成事实（VLAN 是否创建、端口链路类型/PVID/允许列表、
+    接口状态、配置命令行），AI 只基于事实归因；未采集到的维度记为「证据缺口」，
+    不会当成「未配置」。
+  - AI 输出**结论**（配置成功 / 配置失败 / 证据不足）、置信度、风险等级、逐条证据、
+    证据缺口、修复步骤与复核命令；页面可展开查看采集到的证据原文。
 
 - **多 Provider 支持**
   统一封装 `deepseek`（默认）、`openai`、`openai_compatible`（自定义 `base_url`）、`local`（Ollama）。
