@@ -50,6 +50,12 @@ if 'task_history' not in st.session_state:
     st.session_state['task_history'] = []
 if 'last_parsed_tasks' not in st.session_state:
     st.session_state['last_parsed_tasks'] = None
+if 'confirm_remove_all' not in st.session_state:
+    # 「移除所有设备」的两步确认状态；避免误触直接清空设备列表
+    st.session_state['confirm_remove_all'] = False
+if 'dev_flash' not in st.session_state:
+    # 设备操作的一次性提示（跨 st.rerun() 保留）
+    st.session_state['dev_flash'] = None
 
 # AI & 搜索相关会话配置
 default_llm_cfg = config.get('llm', {})
@@ -318,9 +324,18 @@ with st.sidebar:
     
     st.divider()
     st.subheader("📋 已添加设备") 
-    devices_list = device_manager.devices.keys()
+
+    # 一次性提示（跨 st.rerun() 保留，避免 success 被 rerun 冲掉）
+    if st.session_state.get('dev_flash'):
+        _level, _msg = st.session_state['dev_flash']
+        st.session_state['dev_flash'] = None
+        (st.success if _level == 'success' else st.warning)(_msg)
+
+    devices_list = list(device_manager.devices.keys())
     if not devices_list:
         st.info("暂无设备，请先添加")
+        # 列表已空时清掉残留的确认状态
+        st.session_state['confirm_remove_all'] = False
     else:
         col_r1, col_r2 = st.columns(2)
         with col_r1:
@@ -368,6 +383,30 @@ with st.sidebar:
                     st.success(f"已连接 {len(ok)} 台：{', '.join(ok)}")
                 if bad:
                     st.warning(f"连接失败：{', '.join(bad)}")
+        # 破坏性操作单独占一行（侧边栏较窄，与上面两个按钮挤在同一行会折行）
+        if st.button("🗑️ 移除所有设备", use_container_width=True, key="btn_remove_all",
+                     help="断开连接并清空设备列表（含数据库记录），操作前需二次确认"):
+            st.session_state['confirm_remove_all'] = True
+            st.rerun()
+
+        # ---- 移除所有设备：二次确认，避免误触清空列表 ----
+        if st.session_state.get('confirm_remove_all'):
+            st.warning(
+                f"⚠️ 确认要移除**全部 {len(devices_list)} 台设备**吗？"
+                "将断开所有连接并清空设备列表与数据库记录，此操作不可撤销。"
+            )
+            c_yes, c_no = st.columns(2)
+            with c_yes:
+                if st.button("✅ 确认移除", use_container_width=True, key="btn_remove_all_yes"):
+                    removed = device_manager.remove_all_devices()
+                    db_manager.delete_all_devices()
+                    st.session_state['confirm_remove_all'] = False
+                    st.session_state['dev_flash'] = ('success', f"已移除全部设备（共 {removed} 台）")
+                    st.rerun()
+            with c_no:
+                if st.button("❌ 取消", use_container_width=True, key="btn_remove_all_no"):
+                    st.session_state['confirm_remove_all'] = False
+                    st.rerun()
 
         connected_devices = device_manager.get_all_connected()
         for dev_name in list(devices_list): 

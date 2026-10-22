@@ -81,3 +81,12 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute('DELETE FROM devices WHERE name = ?', (name,))
             conn.commit()
+
+    def delete_all_devices(self):
+        """清空设备表，返回被删除的记录数"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM devices')
+            deleted = cursor.rowcount
+            conn.commit()
+            return deleted

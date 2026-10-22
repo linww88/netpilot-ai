@@ -152,6 +152,27 @@ def main():
     check("检测到配置模式时发送 return", conn7.return_sent,
           str(conn7.timing_sent))
 
+    print("\n=== 7. 移除所有设备 ===")
+    dm8 = DeviceManager({})
+    for _n, _p in (("R1", 2001), ("R2", 2002), ("S1", 2003)):
+        dm8.add_device(_n, "127.0.0.1", _p)
+
+    class ClosableConn:
+        def __init__(self):
+            self.closed = False
+
+        def disconnect(self):
+            self.closed = True
+
+    live = ClosableConn()
+    dm8.sessions["R1"] = live
+    removed = dm8.remove_all_devices()
+    check("remove_all_devices 返回移除数量", removed == 3, str(removed))
+    check("设备表已清空", dm8.devices == {}, str(list(dm8.devices.keys())))
+    check("会话表已清空", dm8.sessions == {}, str(list(dm8.sessions.keys())))
+    check("移除前先断开了已有连接", live.closed is True, str(live.closed))
+    check("空列表重复调用幂等", dm8.remove_all_devices() == 0, "应返回 0")
+
     print("\n" + "=" * 50)
     passed = sum(1 for _, ok, _ in results if ok)
     print(f"设备管理器测试结果: {passed}/{len(results)} 通过")

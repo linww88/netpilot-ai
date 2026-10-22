@@ -798,7 +798,43 @@ quit
 
 ---
 
-## 15. 文档更新
+## 15. 新增：「已添加设备」栏目的「移除所有设备」按钮
+
+### 背景
+
+设备列表原先只能逐台移除。做新实验前若残留上一轮设备（如 R1/R2/S1），
+需要逐个展开 expander 点「移除」，既慢又容易漏，残留设备还会干扰后续
+拓扑发现与指令执行时的设备名解析。
+
+### 实现
+
+| 层 | 改动 |
+| --- | --- |
+| `src/connection/device_manager.py` | 新增 `remove_all_devices()`：遍历设备表，**先 `disconnect()` 断开已有会话**，再清空 `devices`，最后兜底 `sessions.clear()`；返回实际移除数量，空表调用返回 0（幂等） |
+| `src/utils/db.py` | 新增 `delete_all_devices()`：`DELETE FROM devices`，返回受影响行数 |
+| `src/main.py` | 「📋 已添加设备」栏目在原有「读取信息并重命名 / 连接全部」下方新增通栏按钮；点击后进入二次确认态 |
+
+### 交互设计
+
+1. 破坏性操作用**独立一行通栏按钮**，不与「连接全部」等常规操作挤在同一行——
+   侧边栏宽度有限，三个按钮并排会折行且容易误点。
+2. **二次确认**：首次点击只展开确认区（`⚠️ 确认要移除全部 N 台设备吗？` +
+   「✅ 确认移除」/「❌ 取消」），不会立即删除；确认状态存于
+   `st.session_state['confirm_remove_all']`，取消或列表已空时自动复位。
+3. **提示不被 rerun 冲掉**：操作后要 `st.rerun()` 刷新列表，`st.success`
+   会随之消失，故改用 `st.session_state['dev_flash']` 暂存提示，在栏目顶部渲染后清除。
+
+### 验证
+
+- `tests/test_device_manager.py` 新增第 7 节 5 条断言（原 12 项 → **17 项**）：
+  返回移除数量、设备表清空、会话表清空、**移除前确实调用了 `disconnect()`**、空表幂等。
+- AppTest 端到端实跑：添加 R1/R2 → 点「移除所有设备」→ 确认区出现且**设备仍在** →
+  点「取消」→ 设备保留、确认状态复位 → 再次点击并「确认移除」→ 设备数 0、
+  出现「暂无设备」空态与「已移除全部设备（共 2 台）」提示，全程 **0 异常**。
+
+---
+
+## 16. 文档更新
 
 | 文件 | 更新内容 |
 | --- | --- |
@@ -812,21 +848,23 @@ quit
 
 ---
 
-## 16. 测试与验证汇总
+## 17. 测试与验证汇总
 
 ### 离线测试套件（不依赖真实设备与网络）
 
-| 测试文件 | 项数 | 覆盖范围 |
+| 测试文件 | 检查项 | 覆盖范围 |
 | --- | --- | --- |
 | `tests/test_device_scan.py` | 29 | 端口扫描、范围纠正、非设备端口识别、主机名与型号解析、批量命名、选择性添加、去重、重命名与会话迁移、DB 元信息、旧库迁移 |
 | `tests/test_command_comments.py` | 21 | 六类命令生成、掩码转换、quit 深度注释、查询命令、输出结构 |
 | `tests/test_deepseek_mock.py` | 14 | LLM 调用链路 Mock |
-| `tests/test_device_manager.py` | 12 | 配置下发兜底、查询兜底、LLDP 三态、退出配置模式、会话恢复 |
+| `tests/test_device_manager.py` | 17 | 配置下发兜底、查询兜底、LLDP 三态、退出配置模式、会话恢复、**移除所有设备** |
 | `tests/test_topology.py` | 10 | hostname 归一化、无伪节点、链路正确、幂等、表头过滤 |
 | `tests/test_topology_refresh.py` | 28 | 拓扑清空与重建不残留、部分采集移除旧设备、采集失败清空图、历史加载后重建无残留、LLDP 收敛等待、行数统计 |
 | `tests/test_no_env.py` | 18 | 无 .env 降级运行：初始化不崩溃、组件可创建、内置模板可用、AI 调用抛友好异常、ENV_HINT 内容、有 Key 可用、local 免 Key |
-| `tests/test_app_startup.py` | 8 | set_page_config 顺序（AST 静态检查 + Streamlit AppTest 运行时检查） |
-| **合计** | **140** | **全部通过** |
+| `tests/test_app_startup.py` | 9 | set_page_config 顺序、**禁止 expander 嵌套**（AST 静态检查 + Streamlit AppTest 运行时检查） |
+| `tests/test_vrp_commands.py` | 31 | Trunk / Access / Hybrid / SVI / OSPF / 静态路由的命令正确性，接口名与 VLAN 写法归一化 |
+| `tests/test_rule_parser.py` | 32 | 本地规则解析（无 AI 兜底）：设备抽取、接口/VLAN/IP/OSPF/路由识别 |
+| **合计** | **209** | **全部通过**（pytest 收集到 44 个测试函数，其余为脚本风格断言） |
 
 ### 真实环境验证
 
@@ -841,10 +879,11 @@ quit
 | 拓扑刷新（新实验覆盖旧实验） | 28/28 离线测试通过，重建不残留历史节点与链路 |
 | 无 .env 降级运行 | 18/18 离线测试通过；无 .env 启动 Streamlit HTTP 200，AI 功能提示引导配置 |
 | set_page_config 顺序 | 8/8 离线测试通过；AppTest 实际运行无异常，标题正常渲染 |
+| 移除所有设备 | 17/17 离线测试通过；AppTest 实跑「点击 → 取消 → 再点击 → 确认」三条路径，0 异常，设备数归零 |
 
 ---
 
-## 17. 改动文件清单
+## 18. 改动文件清单
 
 ### 代码文件（10 个）
 
@@ -855,13 +894,13 @@ quit
 | `src/ai/intent_parser.py` | JSON 提取容错（四种形态）、**AI 不可用时异常上抛** |
 | `src/ai/fault_diagnosis.py` | **AI 不可用时异常上抛**，其余异常结构化返回 |
 | `src/ai/command_gen.py` | 修复 `{task}` KeyError、补齐 3 个模板、命令注释预览、**AI 异常放行** |
-| `src/connection/device_manager.py` | 端口扫描、设备识别、自动命名、名称解析、会话恢复、回显清理、配置读取 |
+| `src/connection/device_manager.py` | 端口扫描、设备识别、自动命名、名称解析、会话恢复、回显清理、配置读取、**批量移除 `remove_all_devices()`** |
 | `src/executor/config_executor.py` | 设备名解析、未匹配任务记录 |
 | `src/topology/builder.py` | 图重置（新增 `clear()`）、hostname 归一化、链路去重、UTF-8 |
 | `src/topology/collector.py` | 新增 LLDP 收敛等待 `wait_lldp_convergence()` 与邻居行数统计 |
 | `src/topology/visualizer.py` | 中文字体、节点标签 |
-| `src/utils/db.py` | 元信息字段、旧库自动迁移 |
-| `src/main.py` | 侧边栏扫描 UI、设备卡片、解析双视图、执行结果渲染、配置读取 UI、拓扑页刷新/清空/收敛等待 |
+| `src/utils/db.py` | 元信息字段、旧库自动迁移、**清空设备表 `delete_all_devices()`** |
+| `src/main.py` | 侧边栏扫描 UI、设备卡片、**移除所有设备（二次确认）**、解析双视图、执行结果渲染、配置读取 UI、拓扑页刷新/清空/收敛等待 |
 
 ### 提示词文件（2 个）
 

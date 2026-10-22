@@ -439,6 +439,27 @@ class DeviceManager:
             self.disconnect(name) 
         return self.devices.pop(name, None) is not None 
 
+    def remove_all_devices(self) -> int:
+        """移除全部设备
+
+        先逐个断开已建立的连接（避免遗留 Telnet 会话占用 eNSP 端口），
+        再清空设备表。返回被移除的设备数量。
+        """
+        names = list(self.devices.keys())
+        removed = 0
+        for name in names:
+            try:
+                if name in self.sessions:
+                    self.disconnect(name)
+            except Exception as e:
+                logger.warning(f"Error disconnecting {name} while removing all: {e}")
+            if self.devices.pop(name, None) is not None:
+                removed += 1
+        # 兜底：清理可能残留的会话记录
+        self.sessions.clear()
+        logger.info(f"remove_all_devices removed {removed} devices")
+        return removed
+
     def list_devices(self) -> List[dict]:
         """返回当前已注册设备信息列表（副本，供 UI/执行器消费）"""
         return [dict(info) for info in self.devices.values()]
