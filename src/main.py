@@ -484,7 +484,7 @@ with tab1:
                 st.session_state['last_parsed_tasks'] = _rule_tasks
                 st.info(
                     "未配置 `.env`，本次由**本地规则解析**完成（支持 Trunk/Access 口、"
-                    "接口 IP、VLAN、SVI、OSPF、静态路由、查询等常见指令）。\n\n"
+                    "接口 IP、VLAN、SVI、OSPF、静态路由、单臂路由子接口、查询等常见指令）。\n\n"
                     "如需解析更复杂的表述，请配置 `.env` 启用 AI。"
                 )
             else:

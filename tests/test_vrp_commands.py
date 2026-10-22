@@ -242,6 +242,119 @@ def test_warnings_when_params_uncovered():
           any("VLAN 1" in w for w in warns2), str(warns2))
 
 
+def test_subinterface_reported_case():
+    """用户原例：单臂路由两个子接口必须都带 arp broadcast enable"""
+    g = CommandGenerator(llm_client=None)
+    # 模型当时的解析结果就是两个独立任务，这里按原样回放
+    tasks = [
+        {"action": "config_interface",
+         "parameters": {"interface": "G0/0/1.2", "ip": "192.168.2.254",
+                        "mask": 24, "encapsulation": "dot1q", "vlan_id": 2}},
+        {"action": "config_interface",
+         "parameters": {"interface": "G0/0/1.3", "ip": "192.168.3.254",
+                        "mask": 24, "encapsulation": "dot1q", "vlan_id": 3}},
+    ]
+    all_cmds = []
+    for t in tasks:
+        all_cmds.extend(g.generate(t))
+
+    check("子接口：dot1q 终结 vid 2 存在",
+          "dot1q termination vid 2" in all_cmds, str(all_cmds))
+    check("子接口：dot1q 终结 vid 3 存在",
+          "dot1q termination vid 3" in all_cmds, str(all_cmds))
+    check("子接口：共两条 arp broadcast enable（两个子接口都不能漏）",
+          all_cmds.count("arp broadcast enable") == 2, str(all_cmds))
+    check("子接口：子接口名展开为完整名",
+          "interface GigabitEthernet0/0/1.2" in all_cmds
+          and "interface GigabitEthernet0/0/1.3" in all_cmds, str(all_cmds))
+    check("子接口：不得出现二层端口命令 port link-type",
+          not any(c.startswith("port link-type") for c in all_cmds), str(all_cmds))
+    check("子接口：不得出现 port default vlan",
+          not any(c.startswith("port default vlan") for c in all_cmds), str(all_cmds))
+    check("子接口：每条子接口都有 IP",
+          sum(1 for c in all_cmds if c.startswith("ip address")) == 2, str(all_cmds))
+
+
+def test_subinterface_single_task_multi_entries():
+    """一个任务里带多条子接口（规则解析器 / 新提示词的输出形态）"""
+    g = CommandGenerator(llm_client=None)
+    cmds = g.generate({
+        "action": "config_subinterface",
+        "parameters": {
+            "interface": "G0/0/1",
+            "sub_interfaces": [
+                {"vid": 2, "ip": "192.168.2.254", "mask": 24},
+                {"vid": 3, "ip": "192.168.3.254", "mask": 24},
+            ],
+        },
+    })
+    check("子接口批量：两条 dot1q", sum(1 for c in cmds if c.startswith("dot1q")) == 2, str(cmds))
+    check("子接口批量：两条 arp broadcast", cmds.count("arp broadcast enable") == 2, str(cmds))
+    check("子接口批量：编号按 vid 推导为 .2/.3",
+          "interface GigabitEthernet0/0/1.2" in cmds
+          and "interface GigabitEthernet0/0/1.3" in cmds, str(cmds))
+    check("子接口批量：每个子接口块以 quit 收尾",
+          cmds.count("quit") == 2 and cmds[-1] == "quit", str(cmds))
+
+
+def test_subinterface_vid_ip_lists():
+    """vlan_id 与 ip 都是列表时按下标配对"""
+    g = CommandGenerator(llm_client=None)
+    cmds = g.generate({
+        "action": "config_subinterface",
+        "parameters": {"interface": "G0/0/1", "vlan_id": [2, 3],
+                       "ip": ["192.168.2.254/24", "192.168.3.254/24"]},
+    })
+    check("子接口列表配对：vid 2 → 192.168.2.254",
+          "ip address 192.168.2.254 255.255.255.0" in cmds, str(cmds))
+    check("子接口列表配对：vid 3 → 192.168.3.254",
+          "ip address 192.168.3.254 255.255.255.0" in cmds, str(cmds))
+    check("子接口列表配对：两条 arp broadcast",
+          cmds.count("arp broadcast enable") == 2, str(cmds))
+
+
+def test_subinterface_arp_autofill():
+    """大模型漏写 arp broadcast enable 时，兜底逻辑必须自动补齐"""
+    g = CommandGenerator(llm_client=None)
+    broken = [
+        "system-view",
+        "interface GigabitEthernet0/0/1.2",
+        "dot1q termination vid 2",
+        "ip address 192.168.2.254 255.255.255.0",
+        "quit",
+        "interface GigabitEthernet0/0/1.3",
+        "dot1q termination vid 3",
+        "ip address 192.168.3.254 255.255.255.0",
+        "arp broadcast enable",
+        "quit",
+    ]
+    fixed, added = g._ensure_dot1q_arp(broken)
+    check("ARP 兜底：只补缺失的那一条", added == 1, f"added={added}")
+    check("ARP 兜底：补齐后共两条",
+          sum(1 for c in fixed if c == "arp broadcast enable") == 2, str(fixed))
+    check("ARP 兜底：插入位置在 quit 之前",
+          fixed.index("arp broadcast enable") == 4, str(fixed))
+    check("ARP 兜底：不重复插入已有的一条",
+          fixed.count("arp broadcast enable") == 2, str(fixed))
+
+    # 正常命令不应被改动
+    untouched, added2 = g._ensure_dot1q_arp(["system-view", "vlan 10", "quit"])
+    check("ARP 兜底：非 dot1q 命令保持原样",
+          untouched == ["system-view", "vlan 10", "quit"] and added2 == 0, str(untouched))
+
+
+def test_subinterface_warns_switch_side():
+    """单臂路由应提示交换机侧需要 Trunk 放通"""
+    g = CommandGenerator(llm_client=None)
+    _, warns = g.generate_with_comments_ex({
+        "action": "config_subinterface",
+        "parameters": {"interface": "G0/0/1",
+                       "sub_interfaces": [{"vid": 2, "ip": "192.168.2.254", "mask": 24}]},
+    })
+    text = " ".join(warns)
+    check("子接口：提示交换机侧配置 Trunk", "Trunk" in text, text)
+
+
 def test_no_empty_commands():
     """任何生成的命令列表都不应包含空串"""
     g = CommandGenerator(llm_client=None)
@@ -281,6 +394,11 @@ def main():
         test_interface_name_normalization,
         test_vlan_parsing_variants,
         test_warnings_when_params_uncovered,
+        test_subinterface_reported_case,
+        test_subinterface_single_task_multi_entries,
+        test_subinterface_vid_ip_lists,
+        test_subinterface_arp_autofill,
+        test_subinterface_warns_switch_side,
         test_no_empty_commands,
     ):
         print(f"\n--- {fn.__name__} ---")

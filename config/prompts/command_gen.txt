@@ -25,8 +25,17 @@
    system-view → interface X → quit
    system-view → ospf 1 → area 0 → network X Y → quit → quit
 6. 从 system-view 开始（查询类 display 命令除外）；不要输出 save / commit 等与配置无关的命令。
-7. 不要输出注释、不要输出解释文字、不要输出 Markdown 代码块围栏。
-8. 参数没给全时，按 VRP 默认值补合理默认，但不要凭空编造 IP 地址、VLAN 号等关键值；
+7. **dot1q 终结子接口（单臂路由）必须按下面顺序输出，且每条子接口都必须有 arp broadcast enable**：
+   system-view
+   → interface GigabitEthernet0/0/1.2
+   → dot1q termination vid 2
+   → ip address 192.168.2.254 255.255.255.0
+   → arp broadcast enable
+   → quit
+   （子接口上**禁止**出现 port link-type / port default vlan —— 那是二层物理口的配置；
+     缺 arp broadcast enable 会导致 ARP 不学习、网关 ping 不通。每条子接口都要有，不能漏。）
+8. 不要输出注释、不要输出解释文字、不要输出 Markdown 代码块围栏。
+9. 参数没给全时，按 VRP 默认值补合理默认，但不要凭空编造 IP 地址、VLAN 号等关键值；
    确实缺失且无法推断的命令直接省略。
 
 只输出 JSON 数组。

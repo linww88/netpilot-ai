@@ -834,7 +834,74 @@ quit
 
 ---
 
-## 16. 文档更新
+## 16. 修复：单臂路由子接口的 `arp broadcast enable` 时有时无
+
+### 现象
+
+输入：
+
+```
+在R1的G0/0/1接口配置子接口分别是2和3，ip分别是192.168.2.254/24，
+192.168.3.254/24，分别封装Dot1q vlan2、3实现VLAN间互访（单臂路由）
+```
+
+生成的两条子接口配置里，**只有 `G0/0/1.3` 带 `arp broadcast enable`，
+`G0/0/1.2` 没有**。缺这条的子接口不会学习 ARP，网关 ping 不通，VLAN 间实际不通。
+
+### 根因（两层）
+
+1. **模板层完全没有子接口支持**。`command_gen.py` 里没有任何 `dot1q` / 子接口逻辑，
+   模型解析出的参数里带有 `encapsulation: "dot1q"`，这个键不在 `_CONSUMED_KEYS`
+   白名单内 → `generate()` 判定"参数未被模板消费" → **整条任务回退给大模型自由生成**。
+2. **模型对每个子接口单独生成，输出不确定**。模型把这句话拆成两个独立任务
+   （`G0/0/1.2` 和 `G0/0/1.3`），两次调用各自生成命令，于是出现了
+   "一个记得加 `arp broadcast enable`、一个忘了"的不一致。
+
+顺带还发现一个潜在错误：即使模板接管，`vlan_id` 会被 `_gen_interface` 当成
+**access 口 VLAN**，生成 `port link-type access` / `port default vlan 2`——
+这两条在子接口上是非法配置。
+
+### 修复
+
+| 层 | 改动 |
+| --- | --- |
+| `command_gen.py` | 新增 `_gen_subinterface()` 与 `config_subinterface` / `config_single_arm` / `config_dot1q` / `config_router_on_a_stick` 等 action 别名 |
+| 同上 | `_gen_interface()` 检测到接口名含 `.`、或参数里有 `encapsulation=dot1q` / `vid` / `sub_interfaces` 时，**转交子接口模板**，避免误判成 access 口 |
+| 同上 | `_CONSUMED_KEYS` 增加 `encapsulation` / `vid` / `sub_interfaces` / `arp_broadcast` 等键，不再触发 LLM 回退 |
+| 同上 | 新增 `_ensure_dot1q_arp()` 全局兜底：扫描命令里每个 `interface …` 块，若块内出现 `dot1q termination vid` 却缺 `arp broadcast enable`，自动在 `quit` 前补上——**无论命令来自模板还是大模型**，都保证一致 |
+| `command_gen.py` | 单臂路由额外告警：提示交换机侧互连口需配 Trunk 并放通对应 VLAN；子接口缺 IP 时告警 |
+| `command_gen.py` | `_parse_vlan_ids` 支持中文连词 `和`/`及`/`与` 作分隔符 |
+| `rule_parser.py` | 新增 `_parse_subinterface()`：识别「子接口/单臂路由/Dot1q」，把 VLAN 与 IP **按下标配对**成 `sub_interfaces`，输出**单个任务** |
+| 提示词 | `intent_parser.txt` 新增 `config_subinterface` 规范（要求多子接口合并为一个任务，禁止输出二层端口命令）+ 示例 8；`command_gen.txt` 新增 dot1q 子接口命令顺序与"每条都必须有 arp broadcast enable"的硬性规则 |
+
+### 修复后的输出
+
+```
+ 1. system-view                     # 进入系统视图（配置模式）
+ 2. interface GigabitEthernet0/0/1.2
+ 3. dot1q termination vid 2         # 子接口封装 Dot1q 并终结 VLAN 2
+ 4. ip address 192.168.2.254 255.255.255.0
+ 5. arp broadcast enable            # 开启 ARP 广播（必需）
+ 6. quit
+ 7. interface GigabitEthernet0/0/1.3
+ 8. dot1q termination vid 3
+ 9. ip address 192.168.3.254 255.255.255.0
+10. arp broadcast enable            # 开启 ARP 广播（必需）
+11. quit
+```
+
+外加提示：*"单臂路由还需在交换机侧把与路由器互连的接口配置为 Trunk，并放通 VLAN 2 3"*。
+
+### 验证
+
+- 真实 DeepSeek 实测：解析结果收敛为**单个任务 + `sub_interfaces` 数组**，11 条命令全部正确、两条都带 `arp broadcast enable`。
+- 清空 Key 走本地规则解析：输出与 AI 路径**完全一致**。
+- AppTest 真实点击「开始解析」：0 异常，界面渲染出上述 11 条命令。
+- 新增测试：`test_vrp_commands.py` 增加 5 组子接口用例（含"子接口不得出现二层端口命令"、"ARP 兜底只补缺失那条"）；`test_rule_parser.py` 增加用户原句与 2 个变体。
+
+---
+
+## 17. 文档更新
 
 | 文件 | 更新内容 |
 | --- | --- |
@@ -848,7 +915,7 @@ quit
 
 ---
 
-## 17. 测试与验证汇总
+## 18. 测试与验证汇总
 
 ### 离线测试套件（不依赖真实设备与网络）
 
@@ -862,9 +929,9 @@ quit
 | `tests/test_topology_refresh.py` | 28 | 拓扑清空与重建不残留、部分采集移除旧设备、采集失败清空图、历史加载后重建无残留、LLDP 收敛等待、行数统计 |
 | `tests/test_no_env.py` | 18 | 无 .env 降级运行：初始化不崩溃、组件可创建、内置模板可用、AI 调用抛友好异常、ENV_HINT 内容、有 Key 可用、local 免 Key |
 | `tests/test_app_startup.py` | 9 | set_page_config 顺序、**禁止 expander 嵌套**（AST 静态检查 + Streamlit AppTest 运行时检查） |
-| `tests/test_vrp_commands.py` | 31 | Trunk / Access / Hybrid / SVI / OSPF / 静态路由的命令正确性，接口名与 VLAN 写法归一化 |
-| `tests/test_rule_parser.py` | 32 | 本地规则解析（无 AI 兜底）：设备抽取、接口/VLAN/IP/OSPF/路由识别 |
-| **合计** | **209** | **全部通过**（pytest 收集到 44 个测试函数，其余为脚本风格断言） |
+| `tests/test_vrp_commands.py` | 51 | Trunk / Access / Hybrid / SVI / OSPF / 静态路由的命令正确性，**单臂路由 dot1q 子接口**（含 ARP 兜底），接口名与 VLAN 写法归一化 |
+| `tests/test_rule_parser.py` | 44 | 本地规则解析（无 AI 兜底）：设备抽取、接口/VLAN/IP/OSPF/路由、**单臂路由子接口**识别 |
+| **合计** | **241** | **全部通过**（pytest 收集到 51 个测试函数，其余为脚本风格断言） |
 
 ### 真实环境验证
 
@@ -880,10 +947,11 @@ quit
 | 无 .env 降级运行 | 18/18 离线测试通过；无 .env 启动 Streamlit HTTP 200，AI 功能提示引导配置 |
 | set_page_config 顺序 | 8/8 离线测试通过；AppTest 实际运行无异常，标题正常渲染 |
 | 移除所有设备 | 17/17 离线测试通过；AppTest 实跑「点击 → 取消 → 再点击 → 确认」三条路径，0 异常，设备数归零 |
+| 单臂路由子接口 | 真实 DeepSeek + 本地规则双路径输出一致，两个子接口均带 `arp broadcast enable`；AppTest 端到端 0 异常 |
 
 ---
 
-## 18. 改动文件清单
+## 19. 改动文件清单
 
 ### 代码文件（10 个）
 
@@ -893,7 +961,7 @@ quit
 | `src/ai/llm_client.py` | 多 Provider 架构、参数解析重写、**无 Key 降级模式与 `LLMUnavailableError`** |
 | `src/ai/intent_parser.py` | JSON 提取容错（四种形态）、**AI 不可用时异常上抛** |
 | `src/ai/fault_diagnosis.py` | **AI 不可用时异常上抛**，其余异常结构化返回 |
-| `src/ai/command_gen.py` | 修复 `{task}` KeyError、补齐 3 个模板、命令注释预览、**AI 异常放行** |
+| `src/ai/command_gen.py` | 修复 `{task}` KeyError、补齐模板、命令注释预览、**AI 异常放行**、**dot1q 子接口模板与 `_ensure_dot1q_arp()` 全局兜底** |
 | `src/connection/device_manager.py` | 端口扫描、设备识别、自动命名、名称解析、会话恢复、回显清理、配置读取、**批量移除 `remove_all_devices()`** |
 | `src/executor/config_executor.py` | 设备名解析、未匹配任务记录 |
 | `src/topology/builder.py` | 图重置（新增 `clear()`）、hostname 归一化、链路去重、UTF-8 |
@@ -906,8 +974,8 @@ quit
 
 | 文件 | 改动 |
 | --- | --- |
-| `config/prompts/intent_parser.txt` | 新增解析规则（必须解析设备名、多设备分别生成、禁止代码块） |
-| `config/prompts/command_gen.txt` | 占位符与代码调用对齐 |
+| `config/prompts/intent_parser.txt` | 新增解析规则（必须解析设备名、多设备分别生成、禁止代码块）、**`config_subinterface` 规范与示例 8** |
+| `config/prompts/command_gen.txt` | 占位符与代码调用对齐、**dot1q 子接口命令顺序与 ARP 必需规则** |
 
 ### 测试文件（6 个，其中 5 个新增）
 

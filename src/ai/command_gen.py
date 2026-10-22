@@ -63,6 +63,20 @@ class CommandGenerator:
             "pvid", "trunk_pvid",
             "shutdown", "no_shutdown", "undo_shutdown",
             "speed", "duplex", "mtu",
+            # 子接口 / dot1q 相关（接口名含 "." 时由子接口模板接管）
+            "encapsulation", "encap", "dot1q", "vid", "dot1q_vid", "termination_vid",
+            "sub_interfaces", "sub_ports", "sub_id", "subinterface", "sub_interface_id",
+            "arp_broadcast", "arp_broadcast_enable",
+        },
+        "subinterface": {
+            "interface", "iface", "port", "interface_name", "port_name",
+            "ip", "ip_address", "mask", "netmask", "prefix", "prefix_length",
+            "description", "desc", "name",
+            "encapsulation", "encap", "dot1q", "vlan_id", "vlan", "vid",
+            "dot1q_vid", "termination_vid", "sub_vlan",
+            "sub_interfaces", "sub_ports", "sub_id", "subinterface",
+            "sub_interface_id", "sub_ids", "interfaces",
+            "arp_broadcast", "arp_broadcast_enable", "shutdown", "undo_shutdown",
         },
         "vlanif": {
             "vlan_id", "vlan", "vlanif", "interface", "iface", "id",
@@ -96,6 +110,12 @@ class CommandGenerator:
             "config_trunk_port": self._gen_interface,
             "config_access": self._gen_interface,
             "config_access_port": self._gen_interface,
+            "config_subinterface": self._gen_subinterface,
+            "config_sub_interface": self._gen_subinterface,
+            "config_subif": self._gen_subinterface,
+            "config_single_arm": self._gen_subinterface,
+            "config_dot1q": self._gen_subinterface,
+            "config_router_on_a_stick": self._gen_subinterface,
             "config_vlanif": self._gen_vlanif,
             "config_svi": self._gen_vlanif,
             "config_vlan_interface": self._gen_vlanif,
@@ -114,6 +134,12 @@ class CommandGenerator:
             "config_trunk_port": "interface",
             "config_access": "interface",
             "config_access_port": "interface",
+            "config_subinterface": "subinterface",
+            "config_sub_interface": "subinterface",
+            "config_subif": "subinterface",
+            "config_single_arm": "subinterface",
+            "config_dot1q": "subinterface",
+            "config_router_on_a_stick": "subinterface",
             "config_vlanif": "vlanif",
             "config_svi": "vlanif",
             "config_vlan_interface": "vlanif",
@@ -144,11 +170,63 @@ class CommandGenerator:
                 logger.info("action=%s 存在模板未覆盖的参数 %s，回退 LLM 生成", action, leftover)
                 llm_cmds = self._generate_with_llm({**task, "parameters": params})
                 if llm_cmds:
-                    return llm_cmds
-            return commands
+                    commands = llm_cmds
+        else:
+            # 未知操作，使用 LLM 生成
+            commands = self._generate_with_llm(task)
 
-        # 未知操作，使用 LLM 生成
-        return self._generate_with_llm(task)
+        # 统一兜底：dot1q 终结子接口必须带 arp broadcast enable。
+        # 无论命令来自确定性模板还是大模型，都在这里补齐，
+        # 避免"同一条指令里一个子接口有、另一个没有"的不一致输出。
+        commands, _padded = self._ensure_dot1q_arp(commands or [])
+        return commands
+
+    @staticmethod
+    def _ensure_dot1q_arp(commands: List[str]) -> Tuple[List[str], int]:
+        """为缺少 arp broadcast enable 的 dot1q 子接口补上该命令
+
+        VRP 上 dot1q 终结子接口默认不处理广播报文，不开 ARP 广播就无法学习
+        ARP，网关 ping 不通、VLAN 间不通。大模型有时只给部分子接口加这条，
+        因此在这里按"接口块"逐个检查并补齐。
+
+        返回 (修正后的命令列表, 补入条数)。
+        """
+        out: List[str] = []
+        buf: List[str] = []
+        in_block = False
+        added = 0
+
+        def close_block() -> None:
+            nonlocal added
+            lows = [x.strip().lower() for x in buf]
+            if any(x.startswith("dot1q termination vid") for x in lows) and \
+                    not any(x.startswith("arp broadcast enable") for x in lows):
+                # 插在块尾的 quit 之前
+                buf.insert(max(len(buf) - 1, 0), "arp broadcast enable")
+                added += 1
+            out.extend(buf)
+
+        for cmd in commands:
+            s = (cmd or "").strip()
+            low = s.lower()
+            if low.startswith("interface "):
+                if in_block:
+                    close_block()
+                buf = [cmd]
+                in_block = True
+            elif low == "quit" and in_block:
+                buf.append(cmd)
+                close_block()
+                buf = []
+                in_block = False
+            elif in_block:
+                buf.append(cmd)
+            else:
+                out.append(cmd)
+
+        if in_block and buf:
+            out.extend(buf)  # 未闭合的接口块原样输出，不猜测补全位置
+        return out, added
 
     def generate_with_comments(self, task: Dict[str, Any]) -> List[Dict[str, str]]:
         """生成「命令 + 注释」列表，用于在界面上直观展示将要下发的配置。
@@ -189,6 +267,19 @@ class CommandGenerator:
         )
         if link_type == "trunk" and not has_allow_pass:
             warnings.append("trunk 口未指定允许通过的 VLAN，VRP 默认仅放通 VLAN 1。")
+
+        # 单臂路由：子接口只解决路由器侧，交换机侧仍需 Trunk 放通对应 VLAN
+        dot1q_vids = [
+            c.split()[-1] for c in commands
+            if c.strip().lower().startswith("dot1q termination vid")
+        ]
+        if dot1q_vids:
+            warnings.append(
+                "单臂路由还需在交换机侧把与路由器互连的接口配置为 Trunk，"
+                f"并放通 VLAN {' '.join(dot1q_vids)}（本任务只含路由器侧子接口命令）。"
+            )
+            if not any(c.strip().lower().startswith("ip address") for c in commands):
+                warnings.append("子接口未配置 IP 地址，无法作为 VLAN 网关。")
 
         result: List[Dict[str, str]] = []
         for idx, cmd in enumerate(commands):
@@ -301,6 +392,9 @@ class CommandGenerator:
         # 统一分隔符
         s = re.sub(r"^(?:vlan|vlanif|vlan-id)\s*", "", s, flags=re.IGNORECASE)
         s = s.replace("，", ",").replace("、", ",").replace("；", ",").replace(";", ",")
+        # 中文连词也当作分隔符：vlan2和3 / 2及3 / 2与3
+        for _sep in ("和", "及", "与"):
+            s = s.replace(_sep, ",")
 
         ids = set()
         # 先处理区间：2-5 / 2~5 / 2 to 5 / 2至5 / 2到5
@@ -373,6 +467,13 @@ class CommandGenerator:
             return []
 
         iface = self._normalize_interface(iface)
+
+        # 子接口（GigabitEthernet0/0/1.2）或显式 dot1q 封装 → 交给子接口模板。
+        # 否则会被误判为 access 口，生成 port link-type / port default vlan
+        # ——这两条在子接口上是非法配置，会把单臂路由配置搞坏。
+        if self._is_subinterface(iface, params):
+            return self._gen_subinterface({**params, "interface": iface})
+
         ip = self._pick(params, "ip", "ip_address")
         mask = self._to_netmask(self._pick(params, "mask", "netmask",
                                           "prefix", "prefix_length"))
@@ -455,6 +556,156 @@ class CommandGenerator:
             commands.append("undo shutdown")
 
         commands.append("quit")
+        return self._dedupe_adjacent(commands)
+
+    # ------------------------------------------------------------------
+    # 子接口（单臂路由 / dot1q 终结）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_subinterface(iface: Any, params: Dict) -> bool:
+        """判断该任务是否应走子接口模板"""
+        if iface and "." in str(iface):
+            return True
+        encap = " ".join(str(params.get(k) or "") for k in
+                         ("encapsulation", "encap", "dot1q")).lower()
+        if "dot1q" in encap or "802.1q" in encap:
+            return True
+        return any(
+            params.get(k) not in (None, "", [], {})
+            for k in ("sub_interfaces", "sub_ports", "vid", "dot1q_vid",
+                      "termination_vid", "sub_id", "subinterface", "sub_interface_id")
+        )
+
+    @staticmethod
+    def _norm_sub_id(value: Any) -> Optional[int]:
+        """把子接口编号归一为整数
+
+        兼容模型给出 "2" / 2 / "G0/0/1.2" 三种形态。
+        """
+        if value is None:
+            return None
+        s = str(value).strip()
+        if "." in s:
+            s = s.rsplit(".", 1)[1]
+        return int(s) if s.isdigit() else None
+
+    def _subinterface_entries(self, params: Dict, base: str) -> List[Dict[str, Any]]:
+        """把各种参数形态归一为子接口条目列表
+
+        支持三种输入：
+        1. `sub_interfaces: [{vid, ip, mask, ...}, ...]`（推荐，规则解析器用这个）
+        2. 单组参数：`{interface: G0/0/1, vlan_id: 2, ip: ..., mask: ...}`
+        3. `vlan_id: [2,3]` + `ip: [a/24, b/24]` 按下标配对
+        """
+        raw = self._pick(params, "sub_interfaces", "sub_ports")
+        entries: List[Dict[str, Any]] = []
+        if isinstance(raw, dict):
+            entries = [raw]
+        elif isinstance(raw, (list, tuple)):
+            entries = [e if isinstance(e, dict) else {"vid": e} for e in raw]
+
+        if not entries:
+            vids = self._parse_vlan_ids(
+                self._pick(params, "vlan_id", "vlan", "vid", "dot1q_vid",
+                           "termination_vid", "sub_vlan")
+            )
+            # 多个 VLAN + 多个 IP：按下标配对成多条子接口
+            ips = self._pick(params, "ip", "ip_address")
+            if isinstance(ips, (list, tuple)) and len(ips) > 1 and len(ips) == len(vids):
+                entries = [{"vid": v, "ip": ip} for v, ip in zip(vids, ips)]
+            else:
+                entries = [params]
+
+        base_has_dot = "." in base
+        base_root = base.rsplit(".", 1)[0] if base_has_dot else base
+        base_suffix = base.rsplit(".", 1)[1] if base_has_dot else ""
+
+        out: List[Dict[str, Any]] = []
+        for idx, e in enumerate(entries):
+            vids = self._parse_vlan_ids(
+                self._pick(e, "vid", "dot1q_vid", "termination_vid", "sub_vlan",
+                           "vlan_id", "vlan")
+            )
+            vid = vids[0] if vids else None
+            sub_id = self._norm_sub_id(
+                self._pick(e, "sub_id", "subinterface", "sub_interface_id")
+            )
+
+            if idx == 0 and base_has_dot:
+                iface = base
+                if vid is None and base_suffix.isdigit():
+                    vid = int(base_suffix)
+                if sub_id is None and base_suffix.isdigit():
+                    sub_id = int(base_suffix)
+            else:
+                if sub_id is None:
+                    sub_id = vid
+                if sub_id is None:
+                    continue
+                iface = f"{base_root}.{sub_id}"
+
+            if vid is None:
+                continue
+
+            ip = self._pick(e, "ip", "ip_address")
+            mask = self._to_netmask(self._pick(e, "mask", "netmask", "prefix",
+                                               "prefix_length"))
+            if ip and "/" in str(ip):
+                addr, pre = str(ip).split("/", 1)
+                ip = addr.strip()
+                mask = mask or self._to_netmask(pre)
+
+            out.append({
+                "iface": iface,
+                "vid": vid,
+                "ip": ip,
+                "mask": mask,
+                "description": self._pick(e, "description", "desc", "name"),
+            })
+        return out
+
+    def _gen_subinterface(self, params: Dict) -> List[str]:
+        """生成 dot1q 终结子接口配置（单臂路由）
+
+        每条子接口固定输出：
+            interface GigabitEthernet0/0/1.N
+             dot1q termination vid N
+             ip address <gw> <mask>
+             arp broadcast enable      ← VRP 必需，缺了 ARP 不通
+            quit
+
+        `arp broadcast enable` 是华为 VRP 上 dot1q 终结子接口的**必需项**：
+        子接口默认不处理广播报文，不开这条就无法收发 ARP，网关 ping 不通、
+        VLAN 间也就无法互访。这里统一由模板补齐，不交给大模型自由发挥。
+        """
+        base = self._normalize_interface(
+            self._pick(params, "interface", "iface", "port",
+                       "interface_name", "port_name")
+        )
+        if not base:
+            return []
+
+        entries = self._subinterface_entries(params, base)
+        if not entries:
+            return []
+
+        # 显式要求关闭时尊重参数，默认一律开启
+        arp_off = params.get("arp_broadcast") is False or \
+            params.get("arp_broadcast_enable") is False
+
+        commands = ["system-view"]
+        for e in entries:
+            commands.append(f"interface {e['iface']}")
+            if e.get("description"):
+                commands.append(f"description {e['description']}")
+            commands.append(f"dot1q termination vid {e['vid']}")
+            if e.get("ip") and e.get("mask"):
+                commands.append(f"ip address {e['ip']} {e['mask']}")
+            elif e.get("ip"):
+                commands.append(f"ip address {e['ip']}")
+            if not arp_off:
+                commands.append("arp broadcast enable")
+            commands.append("quit")
         return self._dedupe_adjacent(commands)
 
     def _gen_vlanif(self, params: Dict) -> List[str]:
@@ -727,6 +978,13 @@ class CommandGenerator:
             return f"Hybrid 口以 tagged 方式放通 VLAN {c[len('port hybrid tagged vlan '):].strip()}"
         if low.startswith("port hybrid untagged vlan "):
             return f"Hybrid 口以 untagged 方式放通 VLAN {c[len('port hybrid untagged vlan '):].strip()}"
+        if low.startswith("dot1q termination vid "):
+            vid = c[len("dot1q termination vid "):].strip()
+            return f"子接口封装 Dot1q 并终结 VLAN {vid}（剥离/添加该 VLAN 的 Tag）"
+        if low.startswith("arp broadcast enable"):
+            return "开启 ARP 广播（dot1q 子接口必需，否则无法学习 ARP、VLAN 间不通）"
+        if low.startswith("arp broadcast"):
+            return "配置子接口 ARP 广播行为"
         if low.startswith("vlan batch "):
             return f"批量创建 VLAN：{c[len('vlan batch '):].strip()}"
         if low.startswith("vlan "):
@@ -763,6 +1021,12 @@ class CommandGenerator:
             "config_vlanif": "VLAN 三层接口配置",
             "config_svi": "VLAN 三层接口配置",
             "config_vlan_interface": "VLAN 三层接口配置",
+            "config_subinterface": "子接口（单臂路由）配置",
+            "config_sub_interface": "子接口（单臂路由）配置",
+            "config_subif": "子接口（单臂路由）配置",
+            "config_single_arm": "单臂路由配置",
+            "config_dot1q": "dot1q 子接口配置",
+            "config_router_on_a_stick": "单臂路由配置",
             "config_ospf": "OSPF 配置",
             "config_static_route": "静态路由配置",
             "config_vlan": "VLAN 配置",

@@ -132,6 +132,49 @@ def test_show_sentence():
     check("查询：不含 system-view", "system-view" not in cmds, str(cmds))
 
 
+def test_subinterface_sentence():
+    """用户原例：单臂路由两个子接口，命令必须完整且一致"""
+    text = ("在R1的G0/0/1接口配置子接口分别是2和3，ip分别是"
+            "192.168.2.254/24，192.168.3.254/24，"
+            "分别封装Dot1q vlan2、3实现VLAN间互访（单臂路由）")
+    tasks, cmds = _pipeline(text)
+    check("单臂路由：解析为单个任务", len(tasks) == 1, str(len(tasks)))
+    check("单臂路由：action 为 config_subinterface",
+          tasks and tasks[0].get("action") == "config_subinterface",
+          str(tasks[0].get("action") if tasks else ""))
+    subs = (tasks[0].get("parameters", {}).get("sub_interfaces") or []) if tasks else []
+    check("单臂路由：解析出 2 条子接口", len(subs) == 2, str(subs))
+    check("单臂路由：VLAN 与 IP 按下标配对",
+          [(s.get("vid"), s.get("ip")) for s in subs]
+          == [(2, "192.168.2.254"), (3, "192.168.3.254")], str(subs))
+    check("单臂路由：两条 dot1q 终结",
+          sum(1 for c in cmds if c.startswith("dot1q termination vid")) == 2, str(cmds))
+    check("单臂路由：**每个子接口都有 arp broadcast enable**",
+          cmds.count("arp broadcast enable") == 2, str(cmds))
+    check("单臂路由：IP 掩码转换为点分十进制",
+          "ip address 192.168.3.254 255.255.255.0" in cmds, str(cmds))
+    check("单臂路由：不得出现 port link-type",
+          not any(c.startswith("port link-type") for c in cmds), str(cmds))
+
+
+def test_subinterface_sentence_variants():
+    """子接口其它常见说法"""
+    rp = RuleParser()
+    cases = [
+        ("在R1的G0/0/1.2上封装dot1q vlan 10，IP 192.168.10.254/24",
+         10, "192.168.10.254"),
+        ("R1的G0/0/2划分子接口，封装Dot1q vlan 20，ip 192.168.20.254/24",
+         20, "192.168.20.254"),
+    ]
+    for text, vid, ip in cases:
+        tasks = rp.parse(text)
+        subs = (tasks[0].get("parameters", {}).get("sub_interfaces") or []) if tasks else []
+        check(f"子接口变体：{text[:18]}… → vid={vid}",
+              bool(subs) and subs[0].get("vid") == vid, str(subs))
+        check(f"子接口变体：{text[:18]}… → ip={ip}",
+              bool(subs) and subs[0].get("ip") == ip, str(subs))
+
+
 def test_unknown_sentence_returns_empty():
     """无法识别的指令返回空列表（由上层决定如何提示）"""
     rp = RuleParser()
@@ -160,6 +203,8 @@ def main():
         test_ospf_multi_device,
         test_static_route_sentence,
         test_show_sentence,
+        test_subinterface_sentence,
+        test_subinterface_sentence_variants,
         test_unknown_sentence_returns_empty,
         test_no_device_no_task,
     ):

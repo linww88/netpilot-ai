@@ -17,9 +17,11 @@
   输入一句话描述需求（例如"在 R1 和 R2 之间配置 OSPF，并在 R1 上创建 VLAN 10"），AI 自动解析为结构化任务清单，
   每项包含 `device`（目标设备）、`action`（动作类型）、`parameters`（关键参数）。
   - 可用动作类型：`config_interface`（含 Trunk/Access/Hybrid/IP）、`config_vlanif`（SVI 网关）、
+    `config_subinterface`（dot1q 子接口 / 单臂路由）、
     `config_ospf`、`config_static_route`、`config_vlan`、`config_acl`、`show_command`；
-    另支持 `config_trunk`、`config_access`、`config_svi` 等语义化别名。
-  - 一条指令涉及多台设备时，为每台设备各生成一个任务对象。
+    另支持 `config_trunk`、`config_access`、`config_svi`、`config_single_arm` 等语义化别名。
+  - 一条指令涉及多台设备时，为每台设备各生成一个任务对象；
+    **同一物理口的多个子接口合并为一个任务**（`sub_interfaces` 数组），不拆散。
 
 - **鲁棒的结果解析** ★
   LLM 返回结果经本地清洗，兼容四种常见格式：纯 JSON 数组、Markdown 代码块包裹、
@@ -28,6 +30,7 @@
 - **本地规则解析（无需 AI）** ★
   `RuleParser` 用正则确定性解析常见中文指令，不依赖大模型与网络：
   - 覆盖 Trunk / Access / Hybrid 口、接口 IP、VLAN 三层接口（SVI）、
+    单臂路由 dot1q 子接口（VLAN 与 IP 按下标配对）、
     创建 VLAN（单个/批量/区间）、OSPF（支持一条指令多设备）、静态路由、查询命令；
   - 未配置 `.env` 时直接启用，并提示"本次由本地规则解析完成"；
   - AI 已配置但未解析出任务时自动兜底，避免"解析失败就完全不可用"。
@@ -36,6 +39,9 @@
   - **内置模板**（本地生成，稳定可复现）：
     - 接口：IP 地址、描述、链路类型（`access` / `trunk` / `hybrid`）、
       Access 默认 VLAN、Trunk 放通 VLAN 与 PVID、`shutdown` / `undo shutdown`；
+    - **dot1q 终结子接口（单臂路由）**：`dot1q termination vid` + `ip address` +
+      **`arp broadcast enable`**；多条子接口一次生成，`G0/0/1` + vid 2/3 自动推导为 `.2` / `.3`；
+      该命令是 VRP 必需项，缺了 ARP 学不到、VLAN 间不通，故由模板统一补齐并做全局兜底；
     - VLAN 三层接口（`Vlanif` / SVI）网关地址；
     - VLAN 单个创建与批量创建（`vlan batch`，连续区间自动压缩为 `a to b`）；
     - OSPF（进程、区域、`network`，支持 `10.0.0.0/24` 前缀写法）、静态路由、ACL（含命名 ACL）、查询命令。
@@ -52,6 +58,7 @@
   `generate_with_comments()` 在生成命令的同时产出逐条中文注释，**不额外调用大模型**：
   - 按命令前缀分类注释（`system-view` / `interface` / `ip address` / `vlan` / `ospf` / `area` / `network` /
     `ip route-static` / `acl` / `rule` / `description` / `display` / `undo` /
+    `dot1q termination vid` / `arp broadcast enable` /
     `port link-type` / `port trunk allow-pass vlan` / `port default vlan` 等）；
   - `quit` 注释按**视图嵌套深度**推导（"退出至用户视图" / "返回系统视图" / "返回上一级视图"）；
   - 未知操作回退按动作类型给出语义化说明。

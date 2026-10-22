@@ -23,6 +23,20 @@
 【config_vlanif】VLAN 三层接口（Vlanif / SVI）配置，用于给 VLAN 配网关 IP
   参数：vlan_id（整数）、ip、mask、description
 
+【config_subinterface】子接口 / dot1q 终结 / 单臂路由（VLAN 间互访）
+  用于"在物理接口下建子接口，分别封装 Dot1q 终结不同 VLAN，各自配网关 IP"的场景。
+  **一条指令里出现的所有子接口，必须合并到同一个任务里**，用 sub_interfaces 数组表达，
+  不要拆成多个任务（拆开会丢失它们属于同一物理口这一关系）。
+  参数：
+  - interface        必填，**物理主接口**（不带 .N），如 "G0/0/1"
+  - sub_interfaces   必填，数组，每个元素是一条子接口：
+      - vid          必填，该子接口终结/封装的 VLAN ID（整数）
+      - ip / mask    建议填写，该子接口的网关 IP；mask 用前缀长度整数（如 24）
+      - sub_id       可选，子接口编号；省略时按惯例等于 vid（即 G0/0/1.2）
+      - description  可选
+  注意：**不要**在这里输出 port link-type / port default vlan —— 子接口不做二层端口配置。
+  arp broadcast enable 由命令生成器统一补齐，你不需要输出它。
+
 【config_vlan】创建 VLAN
   参数：vlan_id（单个为整数，多个为整数数组，如 [10,20,30]）、description
 
@@ -49,7 +63,10 @@
 3. 用户的措辞要**完整映射为参数**，不要丢弃信息。特别注意：
    - 提到 "Trunk" 必须输出 link_type="trunk"，并把"允许 vlan 2、3 通过"转成 allowed_vlans=[2,3]；
    - 提到 "Access"/"接入" 必须输出 link_type="access"，并把 VLAN 转成 default_vlan；
-   - 提到 "放通所有 VLAN"/"全部 VLAN" 时输出 allowed_vlans=[1] 并在 pvid 留空（无法穷举时不猜）。
+   - 提到 "放通所有 VLAN"/"全部 VLAN" 时输出 allowed_vlans=[1] 并在 pvid 留空（无法穷举时不猜）；
+   - 提到 "子接口"/"单臂路由"/"Dot1q"/"封装 VLAN" 时必须用 config_subinterface，
+     interface 填**物理主接口**（去掉 .2 这类子接口后缀），
+     每个子接口的 VLAN 与 IP 按原文顺序一一对应写进 sub_interfaces。
 4. 中文标点（，、；）等价于英文逗号，VLAN 列表中的中文序号要转成整数。
 5. 接口名不要改写、不要补全，保持用户原样（"G0/0/1" 就输出 "G0/0/1"）。
 6. 只输出 JSON 数组，禁止使用 ``` 代码块包裹，禁止输出任何解释文字。
@@ -83,5 +100,9 @@
 示例7（查询）
 用户指令：查看R1的路由表
 输出：[{{"device": "R1", "action": "show_command", "parameters": {{"command": "display ip routing-table"}}}}]
+
+示例8（单臂路由 / dot1q 子接口 —— 多个子接口合并为一个任务）
+用户指令：在R1的G0/0/1接口配置子接口分别是2和3，ip分别是192.168.2.254/24，192.168.3.254/24，分别封装Dot1q vlan2、3实现VLAN间互访（单臂路由）
+输出：[{{"device": "R1", "action": "config_subinterface", "parameters": {{"interface": "G0/0/1", "sub_interfaces": [{{"vid": 2, "ip": "192.168.2.254", "mask": 24}}, {{"vid": 3, "ip": "192.168.3.254", "mask": 24}}]}}}}]
 
 只输出 JSON 数组，不要其他内容。

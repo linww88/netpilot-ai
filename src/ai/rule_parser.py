@@ -96,6 +96,12 @@ class RuleParser:
         if self._is_vlanif(t) and devices:
             return self._parse_vlanif(raw, t, devices[0])
 
+        # 4.5) 单臂路由 / dot1q 子接口
+        if self._is_subinterface(t) and devices:
+            subs = self._parse_subinterface(raw, t, devices[0], iface)
+            if subs:
+                return subs
+
         # 5) 接口配置（Trunk / Access / Hybrid / IP）
         if iface and devices:
             return [self._parse_interface(raw, t, devices[0], iface)]
@@ -162,6 +168,70 @@ class RuleParser:
             if prefix:
                 params["mask"] = prefix
         return [self._task(device, "config_vlanif", params)]
+
+    def _parse_subinterface(self, raw: str, t: str, device: str,
+                            iface: Optional[str]) -> List[Dict[str, Any]]:
+        """解析单臂路由 / dot1q 子接口
+
+        典型输入：
+            在R1的G0/0/1接口配置子接口分别是2和3，ip分别是
+            192.168.2.254/24，192.168.3.254/24，分别封装Dot1q vlan2、3
+            实现VLAN间互访（单臂路由）
+
+        输出：单个任务，`sub_interfaces` 为按下标配对好的条目列表。
+        """
+        if not iface:
+            return []
+
+        base = iface
+        preset_sub: Optional[int] = None
+        if "." in iface:
+            root, suffix = iface.rsplit(".", 1)
+            if suffix.isdigit():
+                base, preset_sub = root, int(suffix)
+
+        vids = self._extract_vlans(raw)
+        ips = self._extract_ip_list(raw)
+        explicit_ids = self._extract_sub_ids(raw)
+
+        if preset_sub is not None:
+            # 接口名已带 .N（如 G0/0/1.2），以它为准；
+            # 只有当用户另外明确列了子接口号时才追加，避免凭空多生成一条。
+            sub_ids = [preset_sub] + [s for s in explicit_ids if s != preset_sub]
+        elif explicit_ids:
+            sub_ids = explicit_ids
+        else:
+            # 子接口号未给出时，惯例用 VLAN ID 作为子接口号
+            sub_ids = list(vids)
+
+        n = max(len(sub_ids), len(vids), len(ips))
+        if n == 0:
+            return []
+
+        entries: List[Dict[str, Any]] = []
+        for i in range(n):
+            entry: Dict[str, Any] = {}
+            sid = sub_ids[i] if i < len(sub_ids) else None
+            vid = vids[i] if i < len(vids) else sid
+            if vid is None:
+                vid = sid
+            if vid is None:
+                continue
+            entry["vid"] = vid
+            if sid is not None and sid != vid:
+                entry["sub_id"] = sid
+            if i < len(ips):
+                ip, prefix = ips[i]
+                entry["ip"] = ip
+                if prefix:
+                    entry["mask"] = prefix
+            entries.append(entry)
+
+        if not entries:
+            return []
+
+        return [self._task(device, "config_subinterface",
+                           {"interface": base, "sub_interfaces": entries})]
 
     def _parse_ospf(self, raw: str, t: str,
                     devices: List[str]) -> List[Dict[str, Any]]:
@@ -278,6 +348,40 @@ class RuleParser:
     def _extract_pvid(raw: str, t: str) -> Optional[int]:
         m = re.search(r"pvid\s*(?:为|是|=)?\s*(?:vlan)?\s*(\d+)", t)
         return int(m.group(1)) if m else None
+
+    def _extract_ip_list(self, raw: str) -> List[Tuple[str, Optional[int]]]:
+        """按出现顺序抽取全部 IP（含可选的 /前缀），并排除掩码形态的串"""
+        out: List[Tuple[str, Optional[int]]] = []
+        for m in re.finditer(r"(\d{1,3}(?:\.\d{1,3}){3})(?:\s*/\s*(\d{1,2}))?", raw):
+            ip = m.group(1)
+            prefix = int(m.group(2)) if m.group(2) else None
+            if prefix is None and re.fullmatch(
+                r"255(?:\.255)*\.0", ip
+            ):
+                continue  # 这是子网掩码，不是地址
+            if any(ip == seen for seen, _ in out):
+                continue
+            out.append((ip, prefix))
+        return out
+
+    def _extract_sub_ids(self, raw: str) -> List[int]:
+        """抽取「子接口分别是2和3」里的子接口号"""
+        m = re.search(
+            r"子接口\s*(?:分别|依次)?\s*(?:是|为|:|：)?\s*"
+            r"([0-9][0-9,，、和及与\-~至到\s]*)",
+            raw,
+        )
+        if not m:
+            m = re.search(r"子接口\s*(\d+)", raw)
+            return [int(m.group(1))] if m else []
+        s = m.group(1)
+        for sep in ("和", "及", "与"):
+            s = s.replace(sep, ",")
+        return self._vlan._parse_vlan_ids(s)
+
+    @staticmethod
+    def _is_subinterface(t: str) -> bool:
+        return any(k in t for k in ("子接口", "单臂路由", "dot1q", "802.1q"))
 
     @staticmethod
     def _extract_ip(raw: str) -> Tuple[Optional[str], Optional[int]]:
