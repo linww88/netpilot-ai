@@ -400,6 +400,9 @@ with st.sidebar:
                 if st.button("✅ 确认移除", use_container_width=True, key="btn_remove_all_yes"):
                     removed = device_manager.remove_all_devices()
                     db_manager.delete_all_devices()
+                    # 清掉指向已删除设备的控件状态，避免下拉框残留旧值
+                    for _k in ("manual_dev", "cfg_dev"):
+                        st.session_state.pop(_k, None)
                     st.session_state['confirm_remove_all'] = False
                     st.session_state['dev_flash'] = ('success', f"已移除全部设备（共 {removed} 台）")
                     st.rerun()
